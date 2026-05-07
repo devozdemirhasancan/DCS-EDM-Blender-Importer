@@ -1,0 +1,67 @@
+name: Sync Wiki
+
+# Pushes the Markdown files in `wiki/` to the repository's GitHub Wiki
+# whenever the contents change on `main`. GitHub maintains the wiki as
+# its own git repository at `<owner>/<repo>.wiki.git`, so we clone it,
+# overlay our `wiki/` directory on top, and push.
+#
+# This lets the wiki be edited via PRs (in the main repo) instead of
+# the GitHub web UI, which gives us code review and history.
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - "wiki/**"
+      - ".github/workflows/wiki-sync.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          path: main
+
+      - name: Configure git
+        run: |
+          git config --global user.name  "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Clone wiki repo
+        run: |
+          git clone "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.wiki.git" wiki || \
+          ( mkdir wiki && cd wiki && git init && \
+            git remote add origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.wiki.git" )
+
+      - name: Overlay markdown files
+        run: |
+          # Wipe the wiki so deletes propagate, but keep the .git directory.
+          find wiki -mindepth 1 -maxdepth 1 ! -name '.git' -exec rm -rf {} +
+          cp -r main/wiki/* wiki/ 2>/dev/null || true
+          # Make sure the home page exists.
+          if [ ! -f wiki/Home.md ]; then
+            echo "# DCS EDM Blender Importer" > wiki/Home.md
+            echo "Welcome to the wiki." >> wiki/Home.md
+          fi
+          ls -la wiki
+
+      - name: Commit & push
+        working-directory: wiki
+        run: |
+          if [ ! -d .git ]; then
+            git init
+            git remote add origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.wiki.git"
+          fi
+          git add .
+          if ! git diff --staged --quiet; then
+            git commit -m "Sync wiki from ${{ github.sha }}"
+            git push origin HEAD:master || git push origin HEAD:main
+          else
+            echo "No wiki changes to publish."
+          fi

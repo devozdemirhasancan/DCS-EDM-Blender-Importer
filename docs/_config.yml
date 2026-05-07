@@ -1,0 +1,91 @@
+# Jekyll configuration for the GitHub Pages docs site.
+#
+# Theme: just-the-docs (https://just-the-docs.com) — the gold-standard
+# navigation/search theme for technical documentation. Picked because:
+#   * Built-in search (no JS framework needed)
+#   * Clean nested navigation via `nav_order` front-matter
+#   * Looks at home on both desktop and mobile
+#   * Actively maintained, easy to override
+
+title: DCS EDM Blender Importer
+description: >
+  Import Eagle Dynamics' DCS World .edm 3-D models directly into Blender 4.x
+  with full materials, textures, rig and DCS-argument-driven animations.
+
+# Replace with your GitHub Pages URL when deploying.
+url: https://devozdemirhasancan.github.io
+baseurl: /DCS-EDM-Blender-Importer
+
+# Theme & plugins ------------------------------------------------------------
+remote_theme: just-the-docs/just-the-docs
+plugins:
+  - jekyll-remote-theme
+  - jekyll-seo-tag
+  - jekyll-sitemap
+  - jekyll-feed
+
+# Navigation -----------------------------------------------------------------
+nav_enabled: true
+search_enabled: true
+search:
+  heading_level: 3
+  previews: 3
+  preview_words_before: 5
+  preview_words_after: 10
+  tokenizer_separator: /[\s\-/]+/
+  rel_url: true
+  button: false
+
+# Aux nav: top-right links
+aux_links:
+  "GitHub":
+    - "https://github.com/devozdemirhasancan/DCS-EDM-Blender-Importer"
+  "Releases":
+    - "https://github.com/devozdemirhasancan/DCS-EDM-Blender-Importer/releases"
+  "Wiki":
+    - "https://github.com/devozdemirhasancan/DCS-EDM-Blender-Importer/wiki"
+
+aux_links_new_tab: true
+
+# Footer
+footer_content: >
+  Released under the MIT License.
+  DCS World and the EDM format are property of Eagle Dynamics SA. This
+  add-on is community-developed and not affiliated with Eagle Dynamics.
+
+# Colour scheme — just-the-docs supports `light`, `dark`, or any custom
+# entry under `_sass/color_schemes/`.
+color_scheme: dark
+
+# Callout styles — used in the docs to highlight important notes/tips.
+callouts_level: quiet
+callouts:
+  highlight:
+    color: yellow
+  important:
+    title: Important
+    color: blue
+  new:
+    title: New
+    color: green
+  note:
+    title: Note
+    color: purple
+  warning:
+    title: Warning
+    color: red
+
+# Code block titles & line numbers
+heading_anchors: true
+
+# SEO
+github:
+  repository_url: https://github.com/devozdemirhasancan/DCS-EDM-Blender-Importer
+
+# Files Jekyll should not publish
+exclude:
+  - "Gemfile"
+  - "Gemfile.lock"
+  - "vendor"
+  - "node_modules"
+  - "_site"

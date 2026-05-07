@@ -1,34 +1,62 @@
-# DCS World EDM Importer for Blender 4.x
+# DCS World EDM Importer for Blender
 
-Blender 4.0 / 4.1 / 4.2+ add-on that imports DCS World `.edm` model files
-(aircraft, cockpits, world objects) into the current scene, complete with
-geometry, materials, textures, an armature, and DCS-argument-driven
-animations.
+[![CI](https://github.com/devozdemirhasancan/DCS-EDM-Blender-Importer/actions/workflows/ci.yml/badge.svg)](https://github.com/devozdemirhasancan/DCS-EDM-Blender-Importer/actions/workflows/ci.yml)
+[![Release](https://github.com/devozdemirhasancan/DCS-EDM-Blender-Importer/actions/workflows/release.yml/badge.svg)](https://github.com/devozdemirhasancan/DCS-EDM-Blender-Importer/releases)
+[![Pages](https://github.com/devozdemirhasancan/DCS-EDM-Blender-Importer/actions/workflows/pages.yml/badge.svg)](https://devozdemirhasancan.github.io/DCS-EDM-Blender-Importer/)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
+A Blender 4.x add-on that imports Eagle Dynamics' DCS World `.edm` 3-D
+models into the current scene — geometry, materials, textures, rig,
+**skin weights** and DCS-argument-driven animations — in a single
+click.
+
+📚 **Full docs:** <https://devozdemirhasancan.github.io/DCS-EDM-Blender-Importer/>
+📖 **Wiki / cheat-sheets:** <https://github.com/devozdemirhasancan/DCS-EDM-Blender-Importer/wiki>
+📦 **Latest release:** <https://github.com/devozdemirhasancan/DCS-EDM-Blender-Importer/releases/latest>
 
 > **Türkçe:** Eagle Dynamics tarafından geliştirilen DCS World'ün özel
-> `.edm` 3B model formatını Blender 4.x'e modüler bir eklenti ile
-> içe aktarır. Geometri, malzemeler, dokular, kemik (rig) yapısı ve DCS
-> argüman tabanlı animasyonlar tek tıklamada içeri çekilir.
+> `.edm` 3B model formatını Blender 4.x'e modüler bir eklenti ile içe
+> aktarır. Geometri, malzemeler, dokular, kemik (rig) yapısı, **skin
+> ağırlıkları** ve DCS argüman tabanlı animasyonlar tek tıklamada
+> içeri çekilir.
 
 ---
 
-## Highlights
+## What's new in 0.3
 
-| What | v0.1 (single file) | **v0.2 (modular)** |
-|------|--------------------|---------------------|
-| Geometry, normals, UVs            | ✅ | ✅ |
-| Texture auto-resolution           | ✅ | ✅ (cached, faster, more search paths) |
-| Materials                         | basic Principled BSDF | **MATERIAL_NAME-aware** (glass / chrome / self-illum / mirror presets), spec map inverted to roughness |
-| **UV V-flip** for DDS textures    | ❌ | ✅ |
-| **Parent-chain world transforms** | ❌ (used only for mirror detection) | ✅ — animated parts land in the correct default pose |
-| **Multi-parent RenderNode split** | ❌ | ✅ (per-part objects with damage-arg metadata) |
-| Armature / rig                    | partial | bone per animating node, NLA stacks |
-| Animations (pos / rot / scale)    | ❌ | ✅ per-argument actions |
-| Visibility animations             | ❌ | ✅ `hide_render` action per argument |
-| Connectors                        | ❌ | ✅ Empty objects, Cube display |
-| Light nodes                       | ❌ | ✅ Blender point lights |
-| Collision shells                  | optional | optional, wireframe display |
-| Code organisation                 | 1167-line single file | 12 small modules + standalone test suite |
+| Area                | Improvement                                                                                                                        |
+| ------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| **Skin weights**    | `SkinNode` per-vertex bone weights become real Blender vertex groups. Each skinned mesh gets an `Armature` modifier so it deforms when the rig animates. |
+| **NumberNode recovery** | Cursor-resync heuristic: scans up to 1 MiB forward for the next valid render-item type. `f-16c_bl50_ED.edm` now imports **319/319** render nodes (was 11). |
+| **Multi-UV layers** | Every present UV channel (4-8) becomes its own Blender UV layer (`UVMap`, `UVMap.001`…) — required for decals / lightmaps.        |
+| **LOD metadata**    | Each mesh records its parent `LodNode`'s distance band as `edm_lod_min` / `edm_lod_max` custom properties.                          |
+| **Animation chain** | Rest-pose math now follows the spec formula `mat * Translate(pos) * Quat1 * Scale * Quat2`; rotation keyframes pre-compose `Quat1`. |
+| **Bone coverage**   | Plain `Bone` nodes are now included in the armature so SkinNode references resolve cleanly.                                        |
+| **Repo workflows**  | GitHub Actions for CI, automated zip releases, GitHub Pages, and Wiki sync.                                                        |
+
+See [`docs/`](docs/) and the [wiki](wiki/) for full details.
+
+## Highlights vs. v0.1
+
+| What                                | v0.1 (single file)                  | **v0.3 (modular)**                                                                                                |
+| ----------------------------------- | ----------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| Geometry, normals, UVs              | ✅                                  | ✅                                                                                                                |
+| **Multi-UV layers**                 | ❌                                  | ✅                                                                                                                |
+| Texture auto-resolution             | ✅                                  | ✅ (cached, faster, more search paths)                                                                            |
+| Materials                           | basic Principled BSDF               | **MATERIAL_NAME-aware** (glass / chrome / self-illum / mirror presets), spec map inverted to roughness            |
+| **UV V-flip** for DDS               | ❌                                  | ✅                                                                                                                |
+| **Parent-chain world transforms**   | ❌ (used only for mirror detection) | ✅ — animated parts land in the correct default pose                                                              |
+| **Multi-parent RenderNode split**   | ❌                                  | ✅ (per-part objects with damage-arg metadata)                                                                    |
+| Armature / rig                      | partial                             | bone per animating + bone node, parented to `Bone` chain                                                          |
+| **Skin weights → vertex groups**    | ❌                                  | ✅                                                                                                                |
+| Animations (pos / rot / scale)      | ❌                                  | ✅ per-argument actions, stacked in NLA                                                                           |
+| Visibility animations               | ❌                                  | ✅ `hide_render` action per argument                                                                              |
+| Connectors                          | ❌                                  | ✅ Empty (Cube)                                                                                                   |
+| Light nodes                         | ❌                                  | ✅ Blender point lights                                                                                           |
+| Collision shells                    | optional                            | optional, wireframe display                                                                                       |
+| **NumberNode recovery**             | ❌ (parsing aborted)                 | ✅ resync heuristic                                                                                               |
+| **LOD metadata**                    | ❌                                  | ✅ as object custom properties                                                                                    |
+| Code organisation                   | 1167-line single file               | 12 small modules + standalone test suite + CI                                                                     |
 
 ---
 
@@ -36,66 +64,41 @@ animations.
 
 ### Option 1 — Pre-built zip (recommended)
 
+Download `dcs_edm_importer-<version>.zip` from the
+[latest release](https://github.com/devozdemirhasancan/DCS-EDM-Blender-Importer/releases/latest).
+
+In Blender: **Edit → Preferences → Add-ons → Install…** and pick the
+zip. Tick the **DCS World EDM Importer** check-box to enable it.
+
+### Option 2 — Build from source
+
 ```powershell
-# in the project root
+git clone https://github.com/devozdemirhasancan/DCS-EDM-Blender-Importer.git
+cd DCS-EDM-Blender-Importer
 .\build.ps1
-# → build/dcs_edm_importer-0.2.0.zip
+# → build/dcs_edm_importer-0.3.0.zip
 ```
 
-In Blender: `Edit ▸ Preferences ▸ Add-ons ▸ Install…` and pick the zip.
-Enable the **DCS World EDM Importer** check-box.
+### Option 3 — Symlink the source folder for development
 
-### Option 2 — Manual copy
-
-Copy the `dcs_edm_importer/` folder into Blender's add-ons directory:
-
-| OS | Default path |
-|----|--------------|
-| Windows | `%APPDATA%\Blender Foundation\Blender\<version>\scripts\addons\` |
-| macOS   | `~/Library/Application Support/Blender/<version>/scripts/addons/` |
-| Linux   | `~/.config/blender/<version>/scripts/addons/` |
-
-Restart Blender and enable the add-on.
+See the [Development guide](https://devozdemirhasancan.github.io/DCS-EDM-Blender-Importer/development/).
 
 ---
 
 ## Usage
 
-`File ▸ Import ▸ DCS World EDM (.edm)`
+**File → Import → DCS World EDM (.edm)**
 
-The dialog exposes:
+The dialog options are documented in detail at the
+[Usage page of the docs](https://devozdemirhasancan.github.io/DCS-EDM-Blender-Importer/usage/).
 
-- **DCS Y-up Correction** — rotate -90° around X so DCS Y-up models stand
-  upright in Blender's Z-up world (default ON).
-- **Wrap in Collection** — group everything inside a Collection named
-  after the file (default ON).
-- **Import Collision Shells** — also import the (normally invisible)
-  collision shells; they're shown as wireframes (default OFF).
-- **Build Armature** — create one bone per animating node (default ON).
-- **Import Animations** — generate keyframe actions for every DCS
-  argument referenced by the model (default ON).
-- **Import Lights** — create Blender Point lights from `LightNode`
-  entries (default ON).
-- **Import Connectors** — create Empty objects from `Connector` entries
-  (default ON).
-- **Extra Texture Folder** — extra search root if your textures live
-  outside the standard DCS install paths.
+After import, every imported object carries `edm_*` custom properties
+(`edm_node_type`, `edm_parent_node`, `edm_damage_arg`,
+`edm_is_collision`, `edm_lod_min`, `edm_lod_max`, `edm_name`) for use
+in scripts and filters.
 
-Multi-file selection in the Import dialog imports each file in turn.
-
-### Texture search order
-
-1. The folder containing the `.edm`
-2. `<edm-folder>/textures/`, `<edm-folder>/../textures/`,
-   `<edm-folder>/../../textures/`, `Bazar/World/textures/`
-3. The user-supplied **Extra Texture Folder**
-4. Standard DCS install paths:
-   - `C:\Program Files\Eagle Dynamics\DCS World\…`
-   - `C:\Program Files\Eagle Dynamics\DCS World OpenBeta\…`
-   - `C:\Program Files (x86)\Steam\steamapps\common\DCSWorld\…`
-   - and a few D:/E:-drive variants
-
-Supported formats: `.dds`, `.png`, `.tga`, `.bmp`, `.jpg`.
+Animations are imported as muted NLA strips named `<model>_argNNN` —
+un-mute the track for the argument you want and scrub the timeline.
 
 ---
 
@@ -107,70 +110,95 @@ dcs_edm_importer/
 ├── blender_manifest.toml  # Blender 4.2+ Extension manifest
 │
 ├── edm/                   # pure-Python parser (no bpy dependency)
-│   ├── reader.py          # low-level binary primitives
-│   ├── types.py           # dataclasses for every node / material
-│   └── parser.py          # named-type dispatch + recovery
+│   ├── reader.py
+│   ├── types.py
+│   └── parser.py          # named-type dispatch + resync recovery
 │
 ├── blender/               # Blender scene construction
-│   ├── transforms.py      # axis correction + world-matrix walker
-│   ├── textures.py        # cached, multi-path texture resolver
+│   ├── transforms.py
+│   ├── textures.py
 │   ├── materials.py       # MATERIAL_NAME-aware Principled BSDF
-│   ├── meshes.py          # mesh + UV flip + multi-parent split
+│   ├── meshes.py          # multi-UV, multi-parent split, skin weights
 │   ├── armature.py        # rig + per-argument NLA actions
 │   ├── extras.py          # connectors, light nodes
 │   └── importer.py        # top-level orchestration
 │
 └── ui/
     └── operator.py        # ImportHelper File→Import operator
+
+docs/        # Jekyll docs site (deployed to GitHub Pages)
+wiki/        # Markdown synced to the GitHub Wiki by Actions
+tests/       # Standalone parser smoke / data-integrity tests
+.github/     # Issue / PR templates + CI / release / Pages / Wiki workflows
 ```
-
-The split lets you:
-
-- **Reuse the parser** outside Blender (see `tests/test_parser.py`).
-- **Hot-reload** any module without restarting Blender (`__init__.py`
-  detects re-execution and reloads sub-modules).
-- **Replace pieces** independently — for example you can swap
-  `MaterialBuilder` for a node-group-based shader without touching the
-  parser.
 
 ---
 
 ## Tested files
 
-| File | Module | Result |
-|------|--------|--------|
-| `f-16c_bl50.edm` (72 MB)     | F-16C Viper | ✅ Full import (296 render nodes, 16 lights, 20 connectors, 297 materials) |
-| `f-16c_bl50_ED.edm` (48 MB)  | F-16C Viper (ED-modified) | ⚠️ Partial (NumberNode body layout outside the public spec; first 11 SkinNodes import correctly, then the category recovers gracefully) |
+| File                         | Module                  | Result                                                                       |
+| ---------------------------- | ----------------------- | ---------------------------------------------------------------------------- |
+| `f-16c_bl50.edm` (72 MB)     | F-16C Viper             | ✅ Full import — 296 render nodes, 16 lights, 20 connectors, 297 mats       |
+| `f-16c_bl50_ED.edm` (48 MB)  | F-16C Viper (ED-build)  | ✅ Full import — 319/319 render nodes via NumberNode resync recovery        |
+
+Got more files to test? Add a row in
+[`wiki/Compatibility-Matrix.md`](wiki/Compatibility-Matrix.md) and open
+a PR — the wiki auto-syncs.
 
 ---
 
 ## Known limitations
 
-- **Skin weights are not yet applied to vertex groups.** Skinned meshes
-  import as static geometry parented to their first bone.
-- **Animation transform chain** (the `tf_Matrix · Translate · Quat1 ·
-  KeyRot · Scale` formula from the EDM spec) is applied as a simple
-  per-bone keyframe stream. Visually correct for hinge / slide motions
-  but may drift on parts whose `quat2` is non-identity.
-- **NumberNode body layout** is undocumented and varies between source
-  files; on files where it differs from the simple base + uint shape we
-  recover gracefully but stop importing further render-items in that
-  category.
-- **No EDM export.** The intent is round-trip to and from Blender, but
-  writing valid index-A / index-B tables and material blobs requires
-  more reverse-engineering than parsing did.
+- **Animation transform chain** is partially applied. We compose
+  `Quat1` with the keyframe rotation correctly, but `Quat2` is treated
+  as identity (true for nearly every aircraft). Visible drift only on
+  parts whose `Quat2` is non-default.
+- **NumberNode body layout** is still undocumented; we skip past it
+  via the resync heuristic rather than parsing it. The data within
+  appears to control rendering hints; for a model viewer / editor this
+  has no visible effect.
+- **No EDM export.** Round-tripping requires authoring valid
+  `indexA` / `indexB` cross-checks, the v10 string lookup table and
+  every node's binary layout — sizable reverse-engineering project.
+
+See the [Troubleshooting page](https://devozdemirhasancan.github.io/DCS-EDM-Blender-Importer/troubleshooting/)
+for fixes to common runtime issues.
 
 ---
 
-## Developer notes
+## Developing
 
-The parser is fully driven by a dispatch table; adding a new EDM node
-type is one method on `EDMFileParser` and one entry in
-`_build_dispatch`. The pure-Python `dcs_edm_importer.edm` package has no
-dependencies beyond the Python stdlib, so you can run
-`python tests/test_parser.py` to smoke-test against any new files.
+The parser sub-package has no Blender dependency, so you can iterate
+on it with plain Python:
 
-Re-build the install zip with `.\build.ps1` after edits.
+```powershell
+python tests/test_parser.py
+python tests/test_data_integrity.py
+```
+
+CI runs the same tests on Python 3.10 and 3.11 against every push.
+
+After Blender-side edits, **F3 → Reload Scripts** reloads every
+sub-module without restarting Blender (the package's `__init__.py` is
+reload-aware).
+
+For more, see the
+[Development guide](https://devozdemirhasancan.github.io/DCS-EDM-Blender-Importer/development/)
+and [Contributing](wiki/Contributing.md).
+
+---
+
+## Releasing
+
+Push a tag and the workflow does the rest:
+
+```powershell
+git tag v0.3.1
+git push origin v0.3.1
+```
+
+`.github/workflows/release.yml` builds the zip, runs the parser smoke
+test, creates a GitHub Release, and attaches the asset.
 
 ---
 
@@ -183,4 +211,4 @@ and documented in their
 
 DCS World and the EDM format are property of Eagle Dynamics SA. This
 add-on is community-developed and not affiliated with or endorsed by
-Eagle Dynamics. Released under the MIT license.
+Eagle Dynamics. Released under the [MIT license](LICENSE).

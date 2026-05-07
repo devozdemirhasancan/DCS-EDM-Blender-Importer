@@ -27,16 +27,17 @@ made in the source tree take effect without restarting Blender.
 
 bl_info = {
     "name": "DCS World EDM Importer",
-    "author": "Community Port (refactored 2026)",
-    "version": (0, 2, 0),
+    "author": "devozdemirhasancan",
+    "version": (0, 3, 0),
     "blender": (4, 0, 0),
     "location": "File > Import > DCS World EDM (.edm)",
     "description": (
         "Import DCS World EDM 3D model files with materials, textures, "
-        "rig and DCS-argument-driven animations."
+        "rig, skin weights and DCS-argument-driven animations."
     ),
     "warning": "",
-    "doc_url": "https://github.com/ndevenish/Blender_ioEDM",
+    "doc_url": "https://devozdemirhasancan.github.io/DCS-EDM-Blender-Importer/",
+    "tracker_url": "https://github.com/devozdemirhasancan/DCS-EDM-Blender-Importer/issues",
     "category": "Import-Export",
 }
 

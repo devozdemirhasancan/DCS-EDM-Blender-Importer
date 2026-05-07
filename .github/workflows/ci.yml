@@ -1,0 +1,68 @@
+name: CI
+
+# Quick sanity checks on every push and pull request. The dcs_edm_importer.edm
+# sub-package has no Blender dependency, so we can run the parser smoke
+# tests in plain Python and `py_compile` everything else to catch syntax
+# errors before they hit users.
+
+on:
+  push:
+    branches: [ main ]
+    paths-ignore:
+      - "docs/**"
+      - "wiki/**"
+      - "**.md"
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  parser:
+    name: Parser & syntax (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # Blender 4.0 ships Python 3.10; 4.2 ships 3.11. Test both so we
+        # catch any 3.11-only syntax we may have inadvertently used.
+        python-version: ["3.10", "3.11"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Compile every module
+        run: |
+          python -m compileall dcs_edm_importer
+
+      - name: Run parser smoke test (only if .edm fixtures present)
+        run: |
+          if compgen -G "*.edm" > /dev/null; then
+            python tests/test_parser.py
+          else
+            echo "No .edm fixtures committed; skipping parser smoke test."
+          fi
+
+  zip-build:
+    name: Verify packaging script
+    runs-on: ubuntu-latest
+    needs: parser
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build zip
+        run: |
+          mkdir -p build
+          STAGE="$(mktemp -d)"
+          cp -r dcs_edm_importer "$STAGE/"
+          find "$STAGE" -type d -name "__pycache__" -exec rm -rf {} + || true
+          find "$STAGE" -type f -name "*.pyc" -delete || true
+          OUT="build/dcs_edm_importer-ci.zip"
+          (cd "$STAGE" && zip -r "$GITHUB_WORKSPACE/$OUT" dcs_edm_importer)
+          ls -lh "$OUT"
+
+      - name: Upload zip artefact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dcs_edm_importer-${{ github.sha }}
+          path: build/dcs_edm_importer-ci.zip
+          retention-days: 14

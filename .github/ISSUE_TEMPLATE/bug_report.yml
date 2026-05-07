@@ -1,0 +1,74 @@
+name: Bug Report
+description: Something doesn't import correctly, crashes, or produces wrong output.
+title: "[BUG] "
+labels: ["bug", "needs triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug! The more concrete
+        details you can provide, the faster we can fix it.
+
+  - type: input
+    id: edm-file
+    attributes:
+      label: EDM file
+      description: Module / aircraft / file path. If you can share the file (or a small reproducer), drag-and-drop it into a comment below.
+      placeholder: "Mods/aircraft/F-16C/Shapes/f-16c_bl50.edm  (72 MB)"
+    validations:
+      required: true
+
+  - type: input
+    id: blender-version
+    attributes:
+      label: Blender version
+      placeholder: "4.2.0 (LTS)"
+    validations:
+      required: true
+
+  - type: input
+    id: addon-version
+    attributes:
+      label: Add-on version
+      description: Visible in Edit → Preferences → Add-ons next to the add-on name, or filename of the zip you installed.
+      placeholder: "0.3.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Windows
+        - Linux
+        - macOS
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of what you did, what you expected, and what actually happened.
+    validations:
+      required: true
+
+  - type: textarea
+    id: console
+    attributes:
+      label: System console output
+      description: Open Blender's system console (Window → Toggle System Console on Windows) and paste any [EDM] lines plus tracebacks.
+      render: shell
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: terms
+    attributes:
+      label: Pre-flight checks
+      options:
+        - label: I searched existing issues and didn't find this one already filed.
+          required: true
+        - label: I'm using the latest released version (or built from `main`).
+          required: false

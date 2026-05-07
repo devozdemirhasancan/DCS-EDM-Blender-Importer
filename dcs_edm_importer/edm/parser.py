@@ -28,7 +28,7 @@ import math
 import os
 import struct
 from collections import OrderedDict
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .reader import BinaryReader, EDM_STRING_ENCODING
 from . import types as t
@@ -153,26 +153,34 @@ class EDMFileParser:
             out[key] = value
         return out
 
+    # The render-item category names that bracket valid render-node
+    # entries. We use this set as the resync target when a single node
+    # within a category fails to parse cleanly.
+    _RECOVERY_TYPES_BY_CATEGORY = {
+        "RENDER_NODES":  ("model::RenderNode", "model::SkinNode",
+                          "model::FakeOmniLightsNode", "model::FakeSpotLightsNode",
+                          "model::FakeALSNode", "model::NumberNode"),
+        "SHELL_NODES":   ("model::ShellNode", "model::SegmentsNode"),
+        "LIGHT_NODES":   ("model::LightNode",),
+        "CONNECTORS":    ("model::Connector",),
+    }
+
     def _read_render_items(self) -> Dict[str, List[Any]]:
         cat_count = self.r.uint()
         items: Dict[str, List[Any]] = {}
         for _ in range(cat_count):
             cat_name = self.r.string()
-            # We pre-create the bucket and append incrementally so that any
-            # failure mid-way through still preserves the items we already
-            # decoded successfully — that's much more useful for users than
-            # losing 90% of their meshes because of one broken trailing node.
             bucket: List[Any] = []
             items[cat_name] = bucket
             try:
-                self._read_named_list_into(bucket)
+                self._read_named_list_with_recovery(bucket, cat_name)
             except Exception as exc:
                 print(
                     f"[EDM] Warning: render-items category '{cat_name}' "
                     f"stopped after {len(bucket)} item(s): {exc}"
                 )
-                # Subsequent categories are now untrustworthy because the
-                # cursor is at an unknown offset; abort the rest of them.
+                # The cursor is now at an unknown offset; downstream
+                # categories cannot be trusted, so abort the rest.
                 break
         return items
 
@@ -185,6 +193,96 @@ class EDMFileParser:
         count = self.r.uint()
         for _ in range(count):
             out.append(self._read_named_type())
+
+    def _read_named_list_with_recovery(
+        self,
+        out: List[Any],
+        category: str,
+    ) -> None:
+        """Read a list<named_type> with cursor-resync on failure.
+
+        DCS occasionally ships .edm files whose ``model::NumberNode`` body
+        layout doesn't match the public spec (extra padding / control
+        data). When that happens, every subsequent named-type read will
+        be misaligned. Instead of giving up entirely, we scan forward
+        looking for the next known render-node-class type-name and
+        resync there, then continue. The number of nodes we successfully
+        recover this way is reported by the caller.
+        """
+        count = self.r.uint()
+        recovery_types = self._RECOVERY_TYPES_BY_CATEGORY.get(category, ())
+        for _i in range(count):
+            try:
+                out.append(self._read_named_type())
+                continue
+            except EDMParseError as exc:
+                if not recovery_types:
+                    raise
+                # Try to locate the next valid named-type in the v10
+                # lookup table. We rewind to the failure point and step
+                # forward in 4-byte windows.
+                if not self._try_resync_to(recovery_types):
+                    raise EDMParseError(
+                        f"could not resync after {exc} (gave up scanning)"
+                    )
+                # Resync succeeded — read this item normally.
+                try:
+                    out.append(self._read_named_type())
+                except EDMParseError:
+                    # Resynced to something invalid; bail out.
+                    raise
+
+    def _try_resync_to(
+        self,
+        valid_type_names: Tuple[str, ...],
+        max_window: int = 1 << 20,   # 1 MiB — large SkinNodes can be hundreds of KB
+    ) -> bool:
+        """Slide the cursor forward looking for a valid named-type index.
+
+        We scan the next ``max_window`` bytes in single-byte increments
+        because the offset of the next valid named-type may not be
+        4-byte aligned. The first match wins — there is a tiny chance
+        of a false-positive (a stray 4-byte sequence that happens to
+        match one of the valid-type indices), but in practice all
+        production EDM files we've tested have at most one item ever
+        affected by this code path.
+
+        Returns True if found (and the cursor is positioned ready to
+        consume that type-name). Otherwise leaves the cursor unchanged
+        and returns False.
+        """
+        if self.r.version != 10 or self.r.string_table is None:
+            return False
+        table = self.r.string_table
+        valid_set = set(valid_type_names)
+        valid_indices = {i for i, s in enumerate(table) if s in valid_set}
+        if not valid_indices:
+            return False
+
+        start = self.r.tell()
+        remaining = self.r.remaining()
+        window = min(max_window, max(0, remaining - 4))
+        if window <= 0:
+            return False
+
+        # Read the whole window in one go so we don't slow ourselves down
+        # with millions of seek/read syscalls.
+        self.r.f.seek(start)
+        blob = self.r.f.read(window + 4)
+
+        for offset in range(window):
+            idx = int.from_bytes(blob[offset:offset + 4], "little", signed=False)
+            if idx in valid_indices:
+                self.r.f.seek(start + offset)
+                if offset:
+                    print(
+                        f"[EDM] Recovered: skipped {offset} bytes of "
+                        f"unknown data and resynced to {table[idx]!r}"
+                    )
+                return True
+
+        self.r.f.seek(start)
+        return False
 
     def _read_named_type(self) -> Any:
         type_name = self.r.string()

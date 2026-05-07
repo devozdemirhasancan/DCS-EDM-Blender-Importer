@@ -2,29 +2,35 @@
 Mesh creation from EDM geometry nodes.
 
 Each :class:`RenderNode`, :class:`ShellNode` and :class:`SkinNode` becomes
-a Blender ``Object``. Important behaviours:
+one (or several) Blender ``Object``. Highlights:
 
-  * **Vertex format aware** — the channel offsets specified in the
-    material's VERTEX_FORMAT (or in the ShellNode itself) are used to
-    pull position / normal / UV / bone-weight data from each vertex.
-  * **UV V-flip** — Blender's UV V coordinate is the inverse of OpenGL's.
-    We mirror it so textures appear right-side-up.
+  * **Vertex format aware** — channel offsets specified by the material's
+    VERTEX_FORMAT (or the ShellNode itself) drive position / normal /
+    UV / bone-weight extraction. We don't assume a fixed layout.
+  * **Multi-UV** — every present UV channel (4..8) becomes its own
+    Blender UV layer (``UVMap``, ``UVMap.001`` ...).
+  * **UV V-flip** — Blender's V is the inverse of the OpenGL V the EDM
+    file stores; we mirror it once on read.
   * **Multi-parent split** — when a RenderNode lists more than one
     ParentEntry, the index buffer is sliced per parent and a separate
-    Blender object is produced. This matches DCS's runtime behaviour of
-    splitting merged meshes back into individual parts.
-  * **Mirror handling** — if the accumulated parent transform has a
-    negative determinant we flip the face winding so the lighting is
-    correct.
+    Blender object produced.
+  * **Skin weights** — for SkinNodes, per-vertex bone indices and weights
+    are written into named vertex groups and the object gets an
+    ``Armature`` modifier so it deforms when the rig animates.
+  * **Mirror handling** — when the accumulated parent transform has a
+    negative determinant we flip face winding so normals stay outward.
+  * **LOD metadata** — meshes record their nearest LOD ancestor's
+    distance range as ``edm_lod_min`` / ``edm_lod_max`` custom
+    properties, useful for filtering/visibility scripts.
 
-Each created object stores ``edm_*`` custom properties (damage argument,
-collision flag, parent index) so users / scripts can inspect or filter
-them later.
+Each created object also stores ``edm_*`` custom properties (damage
+argument, collision flag, parent index) so users / scripts can inspect
+or filter them later.
 """
 
 from __future__ import annotations
 
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import bpy
 import mathutils
@@ -38,6 +44,18 @@ from . import transforms as xf
 # ---------------------------------------------------------------------------
 
 
+# UV channels per the EDM spec. We probe each one and create a Blender UV
+# layer whenever we find non-zero data. UV0 (channel 4) is the most common
+# and always produces a layer named ``UVMap``.
+_UV_CHANNELS = (
+    t.VertexFormat.UV0,
+    t.VertexFormat.UV1,
+    6,
+    7,
+    8,
+)
+
+
 def _vertex_format_for(node, materials: Sequence[t.Material]) -> Optional[t.VertexFormat]:
     """Return the right VertexFormat for any geometry node."""
     if isinstance(node, t.ShellNode):
@@ -48,70 +66,43 @@ def _vertex_format_for(node, materials: Sequence[t.Material]) -> Optional[t.Vert
     return materials[mat_id].vertex_format
 
 
-def _extract_attributes(
-    vtx: Tuple[float, ...],
-    fmt: Optional[t.VertexFormat],
-) -> Tuple[Tuple[float, float, float], Tuple[float, float, float], Tuple[float, float]]:
-    """Pull (position, normal, uv) out of a single vertex tuple.
-
-    Falls back to sane defaults when channels are missing.
-    """
-    if fmt is None or len(fmt.channels) < 1:
-        # Best guess: standard 4-pos / 3-nor / 2-uv layout
-        position = (vtx[0], vtx[1], vtx[2])
-        normal = (vtx[4], vtx[5], vtx[6]) if len(vtx) >= 7 else (0.0, 0.0, 1.0)
-        uv = (vtx[7], vtx[8]) if len(vtx) >= 9 else (0.0, 0.0)
-        return position, normal, uv
-
-    pos_off = fmt.offset_of(t.VertexFormat.POSITION)
-    if pos_off < 0:
-        pos_off = 0
-    position = (vtx[pos_off], vtx[pos_off + 1], vtx[pos_off + 2])
-
-    nor_off = fmt.offset_of(t.VertexFormat.NORMAL)
-    if nor_off >= 0 and nor_off + 2 < len(vtx):
-        normal = (vtx[nor_off], vtx[nor_off + 1], vtx[nor_off + 2])
-    else:
-        normal = (0.0, 0.0, 1.0)
-
-    uv_off = fmt.offset_of(t.VertexFormat.UV0)
-    if uv_off >= 0 and uv_off + 1 < len(vtx):
-        # EDM stores OpenGL-style UVs (origin bottom-left). Blender uses
-        # the same convention internally, but DCS textures (specifically
-        # DDS exports) are flipped relative to the EDM v-coordinate, so
-        # we mirror V here for visually correct results.
-        uv = (vtx[uv_off], 1.0 - vtx[uv_off + 1])
-    else:
-        uv = (0.0, 0.0)
-
-    return position, normal, uv
+def _vec3_at(vtx: Sequence[float], offset: int, default: Tuple[float, float, float]) -> Tuple[float, float, float]:
+    if offset < 0 or offset + 2 >= len(vtx):
+        return default
+    return (vtx[offset], vtx[offset + 1], vtx[offset + 2])
 
 
-def _extract_bone_data(
-    vtx: Tuple[float, ...],
+def _uv_at(vtx: Sequence[float], offset: int) -> Optional[Tuple[float, float]]:
+    if offset < 0 or offset + 1 >= len(vtx):
+        return None
+    # EDM (and most OpenGL pipelines) put UV origin at the bottom-left.
+    # Blender's image space is the same in *theory*, but DCS .dds exports
+    # are conventionally flipped relative to that, so we mirror V here so
+    # textures appear right-side-up.
+    return (vtx[offset], 1.0 - vtx[offset + 1])
+
+
+def _bone_data_at(
+    vtx: Sequence[float],
     fmt: Optional[t.VertexFormat],
 ) -> Optional[Tuple[Tuple[int, int, int, int], Tuple[float, float, float, float]]]:
-    """If the vertex format includes bone data, extract (indices, weights)."""
+    """Pull (indices, weights) out of channel 21 if the format provides it."""
     if fmt is None:
         return None
     off = fmt.offset_of(t.VertexFormat.BONE_WEIGHTS)
     size = fmt.size_of(t.VertexFormat.BONE_WEIGHTS)
     if off < 0 or size < 4 or off + 7 >= len(vtx):
         return None
-    # Per spec there are 8 floats: 4 indices interleaved with 4 weights.
-    indices = (
-        int(vtx[off]),
-        int(vtx[off + 1]),
-        int(vtx[off + 2]),
-        int(vtx[off + 3]),
+    return (
+        (int(vtx[off]), int(vtx[off + 1]), int(vtx[off + 2]), int(vtx[off + 3])),
+        (float(vtx[off + 4]), float(vtx[off + 5]), float(vtx[off + 6]), float(vtx[off + 7])),
     )
-    weights = (
-        float(vtx[off + 4]),
-        float(vtx[off + 5]),
-        float(vtx[off + 6]),
-        float(vtx[off + 7]),
-    )
-    return indices, weights
+
+
+def _present_uv_channels(fmt: Optional[t.VertexFormat]) -> List[int]:
+    if fmt is None:
+        return [t.VertexFormat.UV0]
+    return [c for c in _UV_CHANNELS if fmt.size_of(c) >= 2]
 
 
 # ---------------------------------------------------------------------------
@@ -129,12 +120,26 @@ class MeshBuilder:
         collection: bpy.types.Collection,
         nodes: Sequence,
         axis_mat: mathutils.Matrix,
+        lod_lookup: Optional[Dict[int, Tuple[float, float]]] = None,
     ):
         self._materials = materials
         self._material_builder = material_builder
         self._collection = collection
         self._nodes = nodes
         self._axis_mat = axis_mat
+        self._lod_lookup = lod_lookup or {}
+        # Set later via ``attach_armature`` so the importer can build the
+        # armature first and feed it back in.
+        self._armature_obj: Optional[bpy.types.Object] = None
+        self._bone_for_node: Dict[int, str] = {}
+
+    def attach_armature(
+        self,
+        armature_obj: Optional[bpy.types.Object],
+        bone_for_node: Dict[int, str],
+    ) -> None:
+        self._armature_obj = armature_obj
+        self._bone_for_node = bone_for_node or {}
 
     # ---------------------------------------------------------------- API
     def build_render_node(self, node: t.RenderNode, fallback: str) -> List[bpy.types.Object]:
@@ -147,10 +152,9 @@ class MeshBuilder:
         )
 
     def build_skin_node(self, node: t.SkinNode, fallback: str) -> List[bpy.types.Object]:
-        # SkinNodes don't have ParentEntry rows; they're parented via
-        # `bones`. We treat them as a single object whose 'parent' is the
-        # first bone entry — the actual skinning is set up later in the
-        # armature module.
+        # Use the first bone reference as the placement parent — the
+        # actual deformation comes from the vertex groups + Armature
+        # modifier we set up below.
         parent_entries = [t.ParentEntry(node=node.bones[0])] if node.bones else []
         return self._build_geometry(
             node,
@@ -158,6 +162,7 @@ class MeshBuilder:
             material_id=node.material_id,
             parent_entries=parent_entries,
             is_collision=False,
+            skin_bones=node.bones,
         )
 
     def build_shell_node(self, node: t.ShellNode, fallback: str) -> List[bpy.types.Object]:
@@ -177,6 +182,7 @@ class MeshBuilder:
         material_id: Optional[int],
         parent_entries: Sequence[t.ParentEntry],
         is_collision: bool,
+        skin_bones: Optional[Sequence[int]] = None,
     ) -> List[bpy.types.Object]:
         index_data: List[int] = list(getattr(node, "index_data", []) or [])
         vertex_data = list(getattr(node, "vertex_data", []) or [])
@@ -191,9 +197,8 @@ class MeshBuilder:
             return []
 
         fmt = _vertex_format_for(node, self._materials)
+        uv_channels = _present_uv_channels(fmt)
 
-        # Determine slice-points so we can split a multi-parent RenderNode
-        # into per-parent meshes.
         slices = self._slice_per_parent(parent_entries, len(index_data))
 
         results: List[bpy.types.Object] = []
@@ -206,15 +211,17 @@ class MeshBuilder:
             world_mat = self._world_matrix_for_parent(parent_entry.node)
             is_mirror = world_mat.determinant() < -1e-6
 
-            obj = self._make_blender_mesh(
+            obj_and_used = self._make_blender_mesh(
                 obj_name,
                 vertex_data,
                 slice_indices,
                 fmt,
+                uv_channels,
                 is_mirror=is_mirror,
             )
-            if obj is None:
+            if obj_and_used is None:
                 continue
+            obj, used_vertices = obj_and_used
 
             obj.matrix_world = self._axis_mat @ world_mat
             obj["edm_node_type"] = node.type
@@ -224,9 +231,9 @@ class MeshBuilder:
             if hasattr(node, "name"):
                 obj["edm_name"] = node.name
 
+            self._apply_lod_metadata(obj, parent_entry.node)
+
             if is_collision:
-                # Render collision shells as non-rendering wireframes so they
-                # don't interfere with the main view.
                 obj.display_type = "WIRE"
                 obj.hide_render = True
 
@@ -241,6 +248,9 @@ class MeshBuilder:
                     obj.data.materials[0] = bl_mat
                 else:
                     obj.data.materials.append(bl_mat)
+
+            if skin_bones is not None:
+                self._apply_skin_weights(obj, used_vertices, fmt, skin_bones)
 
             results.append(obj)
         return results
@@ -259,7 +269,6 @@ class MeshBuilder:
         index_count: int,
     ) -> List[Tuple[t.ParentEntry, int, int]]:
         if not parents:
-            # No parent metadata at all; treat the whole node as one piece.
             return [(t.ParentEntry(node=-1), 0, index_count)]
         if len(parents) == 1:
             return [(parents[0], 0, index_count)]
@@ -278,16 +287,39 @@ class MeshBuilder:
             return mathutils.Matrix.Identity(4)
         return xf.world_matrix_for_node(parent_node_idx, self._nodes)
 
+    def _apply_lod_metadata(self, obj: bpy.types.Object, parent_idx: int) -> None:
+        """Walk up ancestors looking for LOD info and stamp it on the object."""
+        if not self._lod_lookup:
+            return
+        node_idx = parent_idx
+        seen: set = set()
+        while 0 <= node_idx < len(self._nodes):
+            if node_idx in seen:
+                break
+            seen.add(node_idx)
+            if node_idx in self._lod_lookup:
+                lo, hi = self._lod_lookup[node_idx]
+                obj["edm_lod_min"] = float(lo)
+                obj["edm_lod_max"] = float(hi)
+                return
+            node_idx = getattr(self._nodes[node_idx], "parent_idx", -1)
+
+    # --------------------------------------------------- mesh construction
     def _make_blender_mesh(
         self,
         name: str,
         vertex_data: Sequence[Tuple[float, ...]],
         index_data: Sequence[int],
         fmt: Optional[t.VertexFormat],
+        uv_channels: Sequence[int],
         is_mirror: bool,
-    ) -> Optional[bpy.types.Object]:
-        # Compress vertex set to only what the indices actually reference.
-        # This both saves memory and avoids "loose" vertices in the mesh.
+    ) -> Optional[Tuple[bpy.types.Object, List[Tuple[float, ...]]]]:
+        """Return ``(blender_object, used_vertex_tuples)`` or ``None``.
+
+        The second element preserves the *raw* vertex tuples we kept (post
+        index-compression) so callers can subsequently extract bone weight
+        data without re-walking the original arrays.
+        """
         used_indices = sorted({i for i in index_data if 0 <= i < len(vertex_data)})
         if not used_indices:
             return None
@@ -297,14 +329,25 @@ class MeshBuilder:
         if len(new_indices) < 3 or len(new_indices) % 3 != 0:
             return None
 
-        positions: List[Tuple[float, float, float]] = []
-        normals: List[Tuple[float, float, float]] = []
-        uvs: List[Tuple[float, float]] = []
-        for vtx in new_vertices:
-            pos, nor, uv = _extract_attributes(vtx, fmt)
-            positions.append(pos)
-            normals.append(nor)
-            uvs.append(uv)
+        # Position offset
+        pos_off = fmt.offset_of(t.VertexFormat.POSITION) if fmt else 0
+        if pos_off < 0:
+            pos_off = 0
+        positions = [_vec3_at(v, pos_off, (0.0, 0.0, 0.0)) for v in new_vertices]
+
+        # Normal offset
+        nor_off = fmt.offset_of(t.VertexFormat.NORMAL) if fmt else -1
+        normals = [_vec3_at(v, nor_off, (0.0, 0.0, 1.0)) for v in new_vertices]
+
+        # Per-channel UV arrays
+        uv_data: List[Optional[List[Tuple[float, float]]]] = []
+        for ch in uv_channels:
+            ch_off = fmt.offset_of(ch) if fmt else (8 if ch == t.VertexFormat.UV0 else -1)
+            uvs_for_ch: List[Tuple[float, float]] = []
+            for v in new_vertices:
+                uv = _uv_at(v, ch_off)
+                uvs_for_ch.append(uv if uv is not None else (0.0, 0.0))
+            uv_data.append(uvs_for_ch)
 
         faces = [
             (new_indices[i], new_indices[i + 1], new_indices[i + 2])
@@ -317,7 +360,8 @@ class MeshBuilder:
         mesh.from_pydata(positions, [], faces)
         mesh.update()
 
-        # Custom split normals
+        # Custom split normals — give materials a believable shading even
+        # before the user manually adds a Smooth-by-Angle modifier.
         if normals:
             split_normals: List[Tuple[float, float, float]] = []
             for poly in mesh.polygons:
@@ -330,15 +374,73 @@ class MeshBuilder:
                 mesh.normals_split_custom_set(split_normals)
             except (RuntimeError, AttributeError):
                 pass
-            # use_auto_smooth only existed up to Blender 4.0; in 4.1+ it
-            # was removed in favour of the Smooth-by-Angle modifier.
+            # ``use_auto_smooth`` was removed in Blender 4.1+ in favour of
+            # the Smooth-by-Angle geometry-nodes modifier, so we only set
+            # it when present.
             if hasattr(mesh, "use_auto_smooth"):
                 mesh.use_auto_smooth = True
 
-        # UV layer
-        uv_layer = mesh.uv_layers.new(name="UVMap")
-        for poly in mesh.polygons:
-            for loop_idx in poly.loop_indices:
-                uv_layer.data[loop_idx].uv = uvs[mesh.loops[loop_idx].vertex_index]
+        # UV layers — one per non-zero channel.
+        for layer_idx, ch in enumerate(uv_channels):
+            uv_name = "UVMap" if layer_idx == 0 else f"UVMap.{layer_idx:03d}"
+            uv_layer = mesh.uv_layers.new(name=uv_name)
+            uvs = uv_data[layer_idx]
+            for poly in mesh.polygons:
+                for loop_idx in poly.loop_indices:
+                    uv_layer.data[loop_idx].uv = uvs[mesh.loops[loop_idx].vertex_index]
 
-        return bpy.data.objects.new(name, mesh)
+        obj = bpy.data.objects.new(name, mesh)
+        return obj, new_vertices
+
+    # ------------------------------------------------------- skinning ----
+    def _apply_skin_weights(
+        self,
+        obj: bpy.types.Object,
+        used_vertices: Sequence[Tuple[float, ...]],
+        fmt: Optional[t.VertexFormat],
+        skin_bones: Sequence[int],
+    ) -> None:
+        """Create per-bone vertex groups and add an Armature modifier."""
+        if self._armature_obj is None or not skin_bones:
+            return
+
+        # Map skin-local index (0..N-1) -> blender bone name.
+        local_to_bone_name: Dict[int, str] = {}
+        for local_idx, scene_idx in enumerate(skin_bones):
+            bone_name = self._bone_for_node.get(scene_idx)
+            if bone_name:
+                local_to_bone_name[local_idx] = bone_name
+
+        if not local_to_bone_name:
+            return
+
+        # Eagerly create vertex groups so ``add()`` doesn't have to test on
+        # each iteration.
+        vg_for_local: Dict[int, bpy.types.VertexGroup] = {}
+        for local_idx, bone_name in local_to_bone_name.items():
+            vg_for_local[local_idx] = obj.vertex_groups.new(name=bone_name)
+
+        # Walk every vertex and assign weights.
+        for vert_idx, vtx in enumerate(used_vertices):
+            bone_data = _bone_data_at(vtx, fmt)
+            if bone_data is None:
+                continue
+            indices, weights = bone_data
+            # Normalise weights so they sum to 1 (DCS's data already is, but
+            # it's cheap insurance against the occasional rounding drift).
+            total = sum(w for w in weights if w > 0.0) or 1.0
+            for local_bone_idx, weight in zip(indices, weights):
+                if weight <= 0.0:
+                    continue
+                vg = vg_for_local.get(local_bone_idx)
+                if vg is None:
+                    continue
+                vg.add([vert_idx], weight / total, "REPLACE")
+
+        # Armature modifier so the rig actually deforms the mesh.
+        modifier = obj.modifiers.new(name="Armature", type="ARMATURE")
+        modifier.object = self._armature_obj
+        modifier.use_vertex_groups = True
+        modifier.use_bone_envelopes = False
+        # Parent so non-deforming transforms still follow.
+        obj.parent = self._armature_obj

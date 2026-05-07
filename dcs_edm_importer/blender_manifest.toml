@@ -10,13 +10,13 @@
 schema_version = "1.0.0"
 
 id = "dcs_edm_importer"
-version = "0.2.0"
+version = "0.3.0"
 name = "DCS World EDM Importer"
-tagline = "Import DCS World EDM models with materials, rig and animations"
-maintainer = "Community Port"
+tagline = "Import DCS World EDM models with materials, rig, skin weights and animations"
+maintainer = "devozdemirhasancan"
 type = "add-on"
 
-website = "https://github.com/ndevenish/Blender_ioEDM"
+website = "https://devozdemirhasancan.github.io/DCS-EDM-Blender-Importer/"
 
 tags = ["Import-Export"]
 
@@ -26,6 +26,6 @@ blender_version_min = "4.0.0"
 # property of Eagle Dynamics; this importer is community-developed.
 license = ["SPDX:MIT"]
 
-copyright = ["2025 Community contributors"]
+copyright = ["2026 devozdemirhasancan and contributors"]
 
 permissions = { files = "Read .edm and texture files from disk" }

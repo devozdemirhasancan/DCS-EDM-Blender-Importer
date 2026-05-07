@@ -1,0 +1,69 @@
+name: Deploy GitHub Pages
+
+# Publishes the `docs/` Jekyll site to GitHub Pages on every push to
+# main. Use the just-the-docs theme for nice navigation and search.
+#
+# The first time this workflow runs, you need to enable Pages in the
+# repository settings:
+#   Settings → Pages → Source: GitHub Actions
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - "docs/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Pages
+        id: pages
+        uses: actions/configure-pages@v5
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.2"
+          bundler-cache: true
+          working-directory: docs
+
+      - name: Build with Jekyll
+        working-directory: docs
+        env:
+          JEKYLL_ENV: production
+          PAGES_REPO_NWO: ${{ github.repository }}
+        run: |
+          bundle exec jekyll build \
+            --source . \
+            --destination _site \
+            --baseurl "${{ steps.pages.outputs.base_path }}"
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/_site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

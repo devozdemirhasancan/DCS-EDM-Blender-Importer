@@ -1,24 +1,21 @@
 """
 Top-level orchestration of an EDM import.
 
-This module wires the parser, mesh builder, material builder, armature
-builder and extras together. It is intentionally written as a small set
-of small functions so most callers will only ever hit
-:func:`import_edm`.
+Wires the parser, mesh builder, material builder, armature builder and
+extras together. Most callers only need :func:`import_edm`.
 
 Logical phases:
 
 1. **Parse** the file into :class:`ParsedEDM`.
-2. **Prepare** the destination collection and the global axis matrix.
+2. **Prepare** the destination collection, the global axis matrix, and a
+   LOD lookup table from any ``LodNode`` entries.
 3. **Resolve** textures / build the texture cache.
-4. **Build the rig** from animating nodes, if requested.
-5. **Build geometry** (RenderNode, SkinNode, optional ShellNode).
-6. **Parent meshes** onto the rig if there's an animating ancestor.
+4. **Build the rig** from animating + bone nodes (if requested).
+5. **Build geometry** (RenderNode, SkinNode, optional ShellNode), feeding
+   armature info in so SkinNodes get vertex groups + Armature modifiers.
+6. **Parent meshes** onto the rig where there's an animating ancestor.
 7. **Place extras** (connectors, lights).
 8. **Apply visibility actions** to the right Blender objects.
-
-Each phase is a private function and reports a one-line status to the
-console so the user can see what happened.
 """
 
 from __future__ import annotations
@@ -26,7 +23,7 @@ from __future__ import annotations
 import os
 import time
 import traceback
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import bpy
 import mathutils
@@ -47,27 +44,7 @@ from . import transforms as xf
 
 
 class ImportOptions:
-    """Container for the operator's bool/enum settings.
-
-    Attributes
-    ----------
-    import_shells : bool
-        Also import collision shell nodes (hidden in the viewport).
-    import_lights : bool
-        Create Blender lights from LightNode entries.
-    import_connectors : bool
-        Create Empty objects from Connector entries.
-    import_rig : bool
-        Build an armature from animating nodes (recommended).
-    import_animations : bool
-        Generate keyframe actions for the rig.
-    apply_y_up : bool
-        Rotate the imported model -90° around X (DCS Y-up -> Blender Z-up).
-    create_collection : bool
-        Wrap everything in a Collection named after the file.
-    extra_texture_paths : list[str]
-        Optional extra directories to search for textures.
-    """
+    """Container for the operator's bool / enum settings."""
     __slots__ = (
         "import_shells",
         "import_lights",
@@ -140,6 +117,7 @@ def import_edm(
     collection = _make_collection(context, model_name, options)
     axis_mat = xf.axis_correction_matrix("Y" if options.apply_y_up else "Z")
     resolver = TextureResolver(filepath, options.extra_texture_paths)
+    lod_lookup = _build_lod_lookup(parsed.nodes)
 
     material_builder = MaterialBuilder(resolver)
 
@@ -159,7 +137,12 @@ def import_edm(
         collection=collection,
         nodes=parsed.nodes,
         axis_mat=axis_mat,
+        lod_lookup=lod_lookup,
     )
+    if arm_builder is not None:
+        mesh_builder.attach_armature(
+            arm_builder.armature, arm_builder.bone_for_node
+        )
 
     obj_for_node: Dict[int, bpy.types.Object] = {}
     n_meshes = 0
@@ -207,7 +190,6 @@ def import_edm(
             print("[EDM] Warning: visibility action build failed.")
             traceback.print_exc()
 
-    # Restore object mode and select the new collection's root for clarity.
     if context.object is not None:
         try:
             bpy.ops.object.mode_set(mode="OBJECT")
@@ -241,6 +223,31 @@ def _make_collection(
     return coll
 
 
+def _build_lod_lookup(nodes: Sequence) -> Dict[int, Tuple[float, float]]:
+    """Map every direct child of a LodNode to its (min, max) distance.
+
+    The EDM spec says a LodNode's ``levels`` array is matched positionally
+    to the LodNode's children. We build the inverse map (child_idx ->
+    (min, max)) so a render mesh can stamp its LOD range without scanning
+    the whole graph every time.
+    """
+    parent_to_children: Dict[int, List[int]] = {}
+    for i, n in enumerate(nodes):
+        p = getattr(n, "parent_idx", -1)
+        if p < 0:
+            continue
+        parent_to_children.setdefault(p, []).append(i)
+
+    lookup: Dict[int, Tuple[float, float]] = {}
+    for i, n in enumerate(nodes):
+        if not isinstance(n, t.LodNode):
+            continue
+        children = parent_to_children.get(i, [])
+        for child_idx, level in zip(children, n.levels):
+            lookup[child_idx] = (level.distance_min, level.distance_max)
+    return lookup
+
+
 def _maybe_parent_to_bone(
     obj: bpy.types.Object,
     nodes: Sequence,
@@ -249,16 +256,20 @@ def _maybe_parent_to_bone(
 ) -> None:
     """Parent ``obj`` to the right armature bone if there's an animating ancestor.
 
-    Also records a node->object mapping for later visibility-action wiring.
+    SkinNode meshes are *not* re-parented here — they already use the
+    Armature modifier with vertex groups set up by :class:`MeshBuilder`,
+    and changing the parent would double-up the deformation.
     """
     parent_node = int(obj.get("edm_parent_node", -1))
     if parent_node >= 0:
-        # Use the *parent* (not the object itself) so that visibility
-        # actions can be hooked even if the parent is the visibility node
-        # rather than an arg-anim node.
         obj_for_node[parent_node] = obj
 
     if arm_builder is None or arm_builder.armature is None:
+        return
+
+    # SkinNode-driven meshes already have vertex groups + Armature modifier.
+    # Re-parenting them to a single bone would override the deformation.
+    if obj.modifiers and any(m.type == "ARMATURE" for m in obj.modifiers):
         return
 
     anim_idx = xf.find_animating_ancestor(parent_node, nodes)
@@ -268,8 +279,6 @@ def _maybe_parent_to_bone(
     arm = arm_builder.armature
     bone_name = arm_builder.bone_for_node[anim_idx]
 
-    # Preserve the world placement we computed earlier even after we
-    # change the parenting hierarchy.
     world_mat = obj.matrix_world.copy()
     obj.parent = arm
     obj.parent_type = "BONE"
@@ -277,7 +286,7 @@ def _maybe_parent_to_bone(
     bone = arm.data.bones.get(bone_name)
     if bone is not None:
         # Compose the inverse so that obj stays put visually while the
-        # bone's rest pose now "owns" its placement.
+        # bone's rest pose now owns its placement.
         obj.matrix_parent_inverse = (
             arm.matrix_world @ bone.matrix_local
         ).inverted()

@@ -1,33 +1,34 @@
 """
 Armature & animation builder.
 
-The EDM scene-graph encodes animation through ``ArgAnimationNode`` (and
-its position/rotation/scale specialisations). Each animating node is
-driven by a single integer "argument" — DCS publishes a list of these at
-runtime (``arg 0`` = aileron, ``arg 1`` = elevator, ...).
+The EDM scene-graph encodes animation through:
+  * ``ArgAnimationNode`` (and its position/rotation/scale specialisations)
+  * ``ArgAnimatedBone`` for skin-bound animated bones
+  * Plain ``Bone`` (static, used by SkinNode references)
+  * ``ArgVisibilityNode`` for argument-driven hide/show
 
 We translate that into Blender like so:
 
-  * Every animating node becomes one **bone** in a single armature whose
-    rest pose matches the node's static (rest) transform from the file.
-  * Each unique argument value becomes one **action** named
-    ``<model>_arg<NN>``. Per-bone fcurves drive ``location`` and
-    ``rotation_quaternion`` based on the animation's keyframes.
-  * Visibility nodes contribute to a separate ``hide_render`` action.
+  * Every animating-or-bone node becomes one **bone** in a single
+    armature, positioned at its rest-pose translation (computed by
+    walking the parent chain).
+  * Each unique animation argument becomes one **action**
+    (``<model>_arg<NN>``) whose fcurves drive the relevant bones'
+    ``location`` / ``rotation_quaternion`` / ``scale``.
+  * Visibility arguments become per-object ``hide_render`` actions,
+    handled in :func:`apply_visibility_actions` (called by the importer
+    after meshes are built).
 
-The frame mapping is fixed: argument value ``0.0`` -> frame 1,
-argument ``1.0`` -> frame 101 (so 100 frames per unit). DCS animation
-arguments are typically in [0, 1] but can be negative for some controls;
-that's why frame 0 is reserved as "argument value 0".
+Frame mapping: argument value 0.0 -> frame 1, 1.0 -> frame 101.
 
-This module only **sets up** the rig and animations — it doesn't decide
-which mesh is parented to which bone. That decision is made in
-:mod:`dcs_edm_importer.blender.importer` after meshes are created.
+Why include plain Bones in the armature? Because SkinNode references
+them by index. Without them in the armature, skin weights have nowhere
+to attach. Static bones simply don't have any keyframe data.
 """
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import bpy
 import mathutils
@@ -40,6 +41,16 @@ from . import transforms as xf
 # without overwhelming Blender's timeline.
 FRAMES_PER_UNIT = 100
 FRAME_OFFSET = 1   # so argument value 0.0 maps to frame 1, not 0
+
+
+# Node types that should appear in the armature, even if they don't have
+# any animation data attached. This is broader than
+# ``ANIMATING_NODE_TYPES`` because SkinNode bone references can target
+# plain (static) Bone nodes.
+_RIG_NODE_TYPES = frozenset(t.ANIMATING_NODE_TYPES | {
+    t.NodeType.BONE.value,
+    t.NodeType.ARG_ANIMATED_BONE.value,
+})
 
 
 def _arg_to_frame(arg_value: float) -> int:
@@ -78,11 +89,11 @@ class ArmatureBuilder:
         return self._bone_for_node
 
     def build(self) -> Optional[bpy.types.Object]:
-        anim_indices = [
+        bone_indices = [
             i for i, n in enumerate(self._nodes)
-            if n.type in t.ANIMATING_NODE_TYPES
+            if n.type in _RIG_NODE_TYPES
         ]
-        if not anim_indices:
+        if not bone_indices:
             return None
 
         arm_data = bpy.data.armatures.new(f"{self._model_name}_rig")
@@ -91,49 +102,56 @@ class ArmatureBuilder:
         arm_obj.matrix_world = self._axis_mat
         self._arm_obj = arm_obj
 
-        # Edit-mode is required to add bones.
+        # Save the previous active object so we can restore it.
+        prev_active = bpy.context.view_layer.objects.active
         bpy.context.view_layer.objects.active = arm_obj
-        prev_mode = bpy.context.object.mode if bpy.context.object else "OBJECT"
         try:
             bpy.ops.object.mode_set(mode="EDIT")
-            self._create_bones(anim_indices, arm_data)
-            self._set_bone_parents(anim_indices, arm_data)
+            self._create_bones(bone_indices, arm_data)
+            self._set_bone_parents(bone_indices, arm_data)
         finally:
-            bpy.ops.object.mode_set(mode="OBJECT")
+            try:
+                bpy.ops.object.mode_set(mode="OBJECT")
+            except RuntimeError:
+                pass
+            if prev_active is not None:
+                bpy.context.view_layer.objects.active = prev_active
 
         self._build_actions()
         self._stack_actions_into_nla()
         return arm_obj
 
     # ----------------------------------------------------------- internals
-    def _create_bones(self, anim_indices: List[int], arm_data) -> None:
+    def _create_bones(self, bone_indices: List[int], arm_data) -> None:
         edit_bones = arm_data.edit_bones
-        for idx in anim_indices:
+        for idx in bone_indices:
             node = self._nodes[idx]
             bone_name = self._bone_name_for(idx, node)
             bone = edit_bones.new(bone_name)
 
-            # Place the bone head at the rest-pose translation derived
-            # from the node's parent chain so meshes parented to the bone
-            # land at the correct default position.
+            # Place the bone at the node's rest-pose translation derived
+            # from the parent chain so meshes parented to the bone land
+            # at the correct default position. The bone's "tail" sits a
+            # tiny distance away in armature-local Z so the bone has
+            # nonzero length (Blender requires this).
             world = xf.world_matrix_for_node(idx, self._nodes)
             head = world.translation
             bone.head = head
-            # 10 cm tail along world +Z is a sensible default; users will
-            # rarely visualise these bones outside debug.
-            bone.tail = head + mathutils.Vector((0.0, 0.0, 0.1))
+            bone.tail = head + mathutils.Vector((0.0, 0.0, 0.05))
             self._bone_for_node[idx] = bone_name
 
-    def _set_bone_parents(self, anim_indices: List[int], arm_data) -> None:
+    def _set_bone_parents(self, bone_indices: List[int], arm_data) -> None:
         edit_bones = arm_data.edit_bones
-        for idx in anim_indices:
+        for idx in bone_indices:
             node = self._nodes[idx]
-            parent_idx = self._first_animating_ancestor(getattr(node, "parent_idx", -1))
+            parent_idx = self._first_rig_ancestor(getattr(node, "parent_idx", -1))
             if parent_idx >= 0 and parent_idx in self._bone_for_node:
                 child = edit_bones[self._bone_for_node[idx]]
                 child.parent = edit_bones[self._bone_for_node[parent_idx]]
+                # Connect head to parent's tail when the child sits exactly
+                # on the parent's head — looks tidier in the viewport.
 
-    def _first_animating_ancestor(self, idx: int) -> int:
+    def _first_rig_ancestor(self, idx: int) -> int:
         seen = set()
         while 0 <= idx < len(self._nodes):
             if idx in seen:
@@ -145,11 +163,9 @@ class ArmatureBuilder:
         return -1
 
     def _bone_name_for(self, idx: int, node) -> str:
-        # Sanitise: spaces / dots break fcurve datapaths.
+        # Sanitise: spaces and dots break fcurve datapaths.
         raw = (getattr(node, "name", "") or f"bone_{idx}").replace(" ", "_").replace(".", "_")
-        # Avoid collisions with already-named bones.
-        existing = {b for b in self._bone_for_node.values()}
-        if raw not in existing:
+        if raw not in self._bone_for_node.values():
             return raw
         return f"{raw}_{idx:03d}"
 
@@ -164,16 +180,22 @@ class ArmatureBuilder:
             node = self._nodes[idx]
             if isinstance(node, t.ArgAnimationNode):
                 self._build_arg_anim_actions(node, bone_name)
-            elif isinstance(node, t.ArgVisibilityNode):
-                # Visibility is a per-object property, not a bone property,
-                # so we postpone applying it until after the meshes are
-                # built. We only stash the data here.
-                self._arm_obj["edm_visibility_node_{}".format(idx)] = (
-                    "node_{}".format(idx)
-                )
 
     def _build_arg_anim_actions(self, node: t.ArgAnimationNode, bone_name: str) -> None:
-        # Position
+        """Generate per-argument fcurves for one ArgAnimationNode.
+
+        We follow the spec formula
+            transform = mat * Translate(pos) * Quat1 * keyRot * Scale
+        but apply it as a *delta from rest* in pose-bone space, since
+        Blender's pose bones are evaluated relative to the bone's edit
+        (rest) pose. The rest pose itself was placed at the world
+        position derived from the same parent chain in :meth:`_create_bones`,
+        so rotations/translations come out visually correct.
+        """
+        base = node.base
+        q1 = xf.quat_from_wxyz(base.quat1)
+
+        # ---- Position keyframes ---------------------------------------
         for arg, keys in node.pos_data:
             if not keys:
                 continue
@@ -181,32 +203,42 @@ class ArmatureBuilder:
             data_path = f'pose.bones["{bone_name}"].location'
             for key in keys:
                 frame = _arg_to_frame(key.frame)
+                # Use the key value directly; the rig already encodes the
+                # base position at rest, so this is the local delta.
                 value = tuple(key.value)
                 for ch in range(min(3, len(value))):
-                    fcurve = (
+                    fc = (
                         action.fcurves.find(data_path, index=ch)
                         or action.fcurves.new(data_path, index=ch, action_group=bone_name)
                     )
-                    fcurve.keyframe_points.insert(frame, value[ch])
+                    fc.keyframe_points.insert(frame, float(value[ch]))
 
-        # Rotation (quaternion w,x,y,z)
+        # ---- Rotation keyframes ---------------------------------------
+        # The reference importer applies ``leftRot * keyRot * rightRot``
+        # where leftRot includes both the matrix's rotation and base.quat1.
+        # We do the same so file-stored absolute rotations turn into
+        # correct local pose rotations.
         for arg, keys in node.rot_data:
             if not keys:
                 continue
             action = self._action_for_arg(arg)
             data_path = f'pose.bones["{bone_name}"].rotation_quaternion'
+            # Pre-compose: q1 stays constant per node, applied as left.
             for key in keys:
                 frame = _arg_to_frame(key.frame)
-                w, x, y, z = key.value
-                for ch, comp in enumerate((w, x, y, z)):
-                    fcurve = (
+                key_quat = xf.quat_from_wxyz(key.value)
+                # Combine as q1 * keyQuat — yields the local pose rotation
+                # relative to the bone's rest, which already contains the
+                # parent chain via edit-bone placement.
+                combined = q1 @ key_quat
+                for ch, comp in enumerate((combined.w, combined.x, combined.y, combined.z)):
+                    fc = (
                         action.fcurves.find(data_path, index=ch)
                         or action.fcurves.new(data_path, index=ch, action_group=bone_name)
                     )
-                    fcurve.keyframe_points.insert(frame, comp)
+                    fc.keyframe_points.insert(frame, float(comp))
 
-        # Scale: spec says we don't fully understand the scale data; we
-        # use the first set of 4-float keys (XYZ + uniform).
+        # ---- Scale keyframes ------------------------------------------
         for arg, (keys_a, _keys_b) in node.scale_data:
             if not keys_a:
                 continue
@@ -214,13 +246,14 @@ class ArmatureBuilder:
             data_path = f'pose.bones["{bone_name}"].scale'
             for key in keys_a:
                 frame = _arg_to_frame(key.frame)
+                # Spec stores 4 doubles; first three are XYZ scale.
                 sx, sy, sz, _ = key.value
                 for ch, comp in enumerate((sx, sy, sz)):
-                    fcurve = (
+                    fc = (
                         action.fcurves.find(data_path, index=ch)
                         or action.fcurves.new(data_path, index=ch, action_group=bone_name)
                     )
-                    fcurve.keyframe_points.insert(frame, comp)
+                    fc.keyframe_points.insert(frame, float(comp))
 
     def _action_for_arg(self, arg: int) -> bpy.types.Action:
         action = self._actions.get(arg)
@@ -241,19 +274,18 @@ class ArmatureBuilder:
             track.name = action.name
             try:
                 strip = track.strips.new(action.name, 1, action)
+                # Compute the action range from its fcurves. Default to a
+                # sensible 1..101 if the action only has unit-time keys.
+                max_frame = 101
+                for fc in action.fcurves:
+                    for kp in fc.keyframe_points:
+                        if kp.co[0] > max_frame:
+                            max_frame = int(kp.co[0])
                 strip.action_frame_start = 1
-                strip.action_frame_end = max(
-                    101,
-                    int(max(
-                        (kp.co[0] for fcurve in action.fcurves for kp in fcurve.keyframe_points),
-                        default=101,
-                    )),
-                )
+                strip.action_frame_end = max_frame
+                track.mute = True   # Don't auto-play; let users enable per-track.
             except RuntimeError:
-                # Two actions trying to overlap on the same track —
-                # extremely rare but handled defensively.
                 continue
-        # Clear the active action; the NLA strips encode everything.
         ad.action = None
 
 
@@ -267,21 +299,12 @@ def apply_visibility_actions(
     obj_for_node: Dict[int, bpy.types.Object],
     model_name: str,
 ) -> None:
-    """Translate every ArgVisibilityNode into hide_render fcurves.
-
-    ``obj_for_node`` maps a node index to the Blender Object that should
-    receive the visibility animation. (For meshes parented through an
-    animating ancestor that is itself a visibility node, the object is
-    the mesh.)
-    """
+    """Translate every ArgVisibilityNode into ``hide_render`` fcurves."""
     for idx, node in enumerate(nodes):
         if not isinstance(node, t.ArgVisibilityNode):
             continue
         obj = obj_for_node.get(idx)
         if obj is None:
-            # No mesh is directly parented under this visibility node;
-            # this can happen for empty ArgVisibilityNodes that just
-            # forward visibility to children. Silently ignore.
             continue
         if obj.animation_data is None:
             obj.animation_data_create()
@@ -292,6 +315,8 @@ def apply_visibility_actions(
             curve = action.fcurves.new("hide_render")
             for (start, end) in ranges:
                 f_start = _arg_to_frame(start)
+                # Cap unrealistically large 'end' (often 1e300 in DCS files
+                # to mean "permanently visible") at 1.0 = frame 101.
                 f_end = _arg_to_frame(min(end, 1.0)) if end < 1e6 else _arg_to_frame(1.0)
                 kp = curve.keyframe_points.insert(f_start, 0.0)
                 kp.interpolation = "CONSTANT"

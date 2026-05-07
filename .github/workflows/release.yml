@@ -1,0 +1,106 @@
+name: Release
+
+# Build the add-on zip and attach it to a GitHub Release whenever a
+# version tag (e.g. ``v0.2.0``) is pushed. Maintainer workflow:
+#
+#   git tag v0.2.0
+#   git push origin v0.2.0
+#
+# The job creates the release if it doesn't already exist, then uploads
+# ``dcs_edm_importer-<version>.zip`` as a release asset. End-users can
+# download the asset directly from the Releases tab and feed it to
+# Blender's "Install Add-on" dialog.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Version tag to use (e.g. v0.2.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write   # needed for softprops/action-gh-release to attach assets
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Resolve version
+        id: version
+        run: |
+          if [ -n "${{ inputs.tag }}" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          VERSION="${TAG#v}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Building release for tag $TAG (version $VERSION)"
+
+      - name: Sanity-check the parser
+        # No Blender required — exercises the pure-Python edm package on
+        # any sample .edm files committed to the repo.
+        run: |
+          if compgen -G "*.edm" > /dev/null; then
+            python tests/test_parser.py
+          else
+            echo "No .edm fixtures present; skipping parser smoke test."
+          fi
+
+      - name: Build add-on zip
+        id: build
+        run: |
+          mkdir -p build
+          OUT="build/dcs_edm_importer-${{ steps.version.outputs.version }}.zip"
+          # Stage the package without __pycache__ so the zip stays small.
+          STAGE="$(mktemp -d)"
+          cp -r dcs_edm_importer "$STAGE/"
+          find "$STAGE" -type d -name "__pycache__" -exec rm -rf {} + || true
+          find "$STAGE" -type f -name "*.pyc" -delete || true
+          (cd "$STAGE" && zip -r "$GITHUB_WORKSPACE/$OUT" dcs_edm_importer)
+          echo "asset=$OUT" >> "$GITHUB_OUTPUT"
+          ls -lh "$OUT"
+
+      - name: Generate release notes
+        id: notes
+        run: |
+          {
+            echo "notes<<EOF"
+            echo "## DCS EDM Importer ${{ steps.version.outputs.tag }}"
+            echo ""
+            echo "Drop-in Blender 4.x add-on for importing DCS World \`.edm\` 3-D models."
+            echo ""
+            echo "### Install"
+            echo ""
+            echo "1. Download \`dcs_edm_importer-${{ steps.version.outputs.version }}.zip\` (asset below)."
+            echo "2. Blender → Edit → Preferences → Add-ons → **Install…** → pick the zip."
+            echo "3. Enable the **DCS World EDM Importer** check-box."
+            echo "4. Use **File → Import → DCS World EDM (.edm)**."
+            echo ""
+            echo "Full documentation: https://devozdemirhasancan.github.io/DCS-EDM-Blender-Importer/"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create / update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: ${{ steps.version.outputs.tag }}
+          body: ${{ steps.notes.outputs.notes }}
+          files: ${{ steps.build.outputs.asset }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true

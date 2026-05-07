@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Documentation
+    url: https://devozdemirhasancan.github.io/DCS-EDM-Blender-Importer/
+    about: Full installation, usage, troubleshooting and developer docs.
+  - name: Wiki
+    url: https://github.com/devozdemirhasancan/DCS-EDM-Blender-Importer/wiki
+    about: Cheat-sheets, FAQ, recipes, compatibility matrix.
+  - name: Discussions
+    url: https://github.com/devozdemirhasancan/DCS-EDM-Blender-Importer/discussions
+    about: Ask questions, share screenshots of imported models, swap recipes.
