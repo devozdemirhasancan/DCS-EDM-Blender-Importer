@@ -13,8 +13,10 @@ Logical phases:
 4. **Build the rig** from animating + bone nodes (if requested).
 5. **Build geometry** (RenderNode, SkinNode, optional ShellNode), feeding
    armature info in so SkinNodes get vertex groups + Armature modifiers.
-6. **Parent meshes** onto the rig where there's an animating ancestor.
-7. **Place extras** (connectors, lights).
+6. **Bind meshes to bones** — a uniform "single vertex group + Armature
+   modifier" approach so static and animated meshes follow the rig with
+   one mechanism. See :func:`_attach_to_rig`.
+7. **Place extras** (connectors, lights), bone-parented when applicable.
 8. **Apply visibility actions** to the right Blender objects.
 """
 
@@ -118,6 +120,7 @@ def import_edm(
     axis_mat = xf.axis_correction_matrix("Y" if options.apply_y_up else "Z")
     resolver = TextureResolver(filepath, options.extra_texture_paths)
     lod_lookup = _build_lod_lookup(parsed.nodes)
+    print(f"[EDM]   texture search paths: {len(resolver.search_paths)}")
 
     material_builder = MaterialBuilder(resolver)
 
@@ -156,7 +159,8 @@ def import_edm(
             objs = []
         for obj in objs:
             n_meshes += 1
-            _maybe_parent_to_bone(obj, parsed.nodes, arm_builder, obj_for_node)
+            _attach_to_rig(obj, parsed.nodes, arm_builder)
+            _record_obj_for_node(obj, obj_for_node)
 
     if options.import_shells:
         for i, node in enumerate(parsed.shell_nodes):
@@ -164,14 +168,16 @@ def import_edm(
                 objs = mesh_builder.build_shell_node(node, f"{model_name}_shell_{i:04d}")
                 for obj in objs:
                     n_meshes += 1
-                    _maybe_parent_to_bone(obj, parsed.nodes, arm_builder, obj_for_node)
+                    _attach_to_rig(obj, parsed.nodes, arm_builder)
+                    _record_obj_for_node(obj, obj_for_node)
 
     n_connectors = 0
     if options.import_connectors:
         for connector in parsed.connectors:
             if isinstance(connector, t.Connector):
                 obj = create_connector(connector, parsed.nodes, axis_mat, collection)
-                _maybe_parent_to_bone(obj, parsed.nodes, arm_builder, obj_for_node)
+                _attach_extra_to_bone(obj, parsed.nodes, arm_builder)
+                _record_obj_for_node(obj, obj_for_node)
                 n_connectors += 1
 
     n_lights = 0
@@ -180,7 +186,8 @@ def import_edm(
             if isinstance(light, t.LightNode):
                 obj = create_light(light, parsed.nodes, axis_mat, collection)
                 if obj is not None:
-                    _maybe_parent_to_bone(obj, parsed.nodes, arm_builder, obj_for_node)
+                    _attach_extra_to_bone(obj, parsed.nodes, arm_builder)
+                    _record_obj_for_node(obj, obj_for_node)
                     n_lights += 1
 
     if options.import_animations and arm_builder is not None:
@@ -203,6 +210,11 @@ def import_edm(
         f"[EDM] Done in {elapsed:.2f}s  "
         f"meshes={n_meshes}  lights={n_lights}  connectors={n_connectors}"
     )
+    if arm_builder and arm_builder._actions:
+        print(
+            f"[EDM]   actions: {len(arm_builder._actions)} "
+            f"(active = {arm_builder._arm_obj.animation_data.action.name if arm_builder._arm_obj.animation_data and arm_builder._arm_obj.animation_data.action else 'none'})"
+        )
     return {"FINISHED"}
 
 
@@ -227,9 +239,9 @@ def _build_lod_lookup(nodes: Sequence) -> Dict[int, Tuple[float, float]]:
     """Map every direct child of a LodNode to its (min, max) distance.
 
     The EDM spec says a LodNode's ``levels`` array is matched positionally
-    to the LodNode's children. We build the inverse map (child_idx ->
-    (min, max)) so a render mesh can stamp its LOD range without scanning
-    the whole graph every time.
+    to its children. We build the inverse map (child_idx -> (min, max))
+    so a render mesh can stamp its LOD range without scanning the whole
+    graph every time.
     """
     parent_to_children: Dict[int, List[int]] = {}
     for i, n in enumerate(nodes):
@@ -248,46 +260,113 @@ def _build_lod_lookup(nodes: Sequence) -> Dict[int, Tuple[float, float]]:
     return lookup
 
 
-def _maybe_parent_to_bone(
+def _record_obj_for_node(
     obj: bpy.types.Object,
-    nodes: Sequence,
-    arm_builder: Optional[ArmatureBuilder],
     obj_for_node: Dict[int, bpy.types.Object],
 ) -> None:
-    """Parent ``obj`` to the right armature bone if there's an animating ancestor.
-
-    SkinNode meshes are *not* re-parented here — they already use the
-    Armature modifier with vertex groups set up by :class:`MeshBuilder`,
-    and changing the parent would double-up the deformation.
-    """
     parent_node = int(obj.get("edm_parent_node", -1))
     if parent_node >= 0:
         obj_for_node[parent_node] = obj
 
+
+def _attach_to_rig(
+    obj: bpy.types.Object,
+    nodes: Sequence,
+    arm_builder: Optional[ArmatureBuilder],
+) -> None:
+    """Attach a mesh object to the rig using a uniform mechanism.
+
+    Unifies static and animated meshes:
+
+      * If the mesh is already a SkinNode (it already has its own
+        Armature modifier), we leave it alone — re-binding would
+        double-deform.
+      * Otherwise we object-parent to the armature, give the mesh a
+        single full-weight vertex group named after the closest rig
+        ancestor, and add an Armature modifier. The mesh follows that
+        bone exactly, including all DCS argument animations.
+
+    This avoids Blender's "bone parent puts the child at the bone tail"
+    quirk that produced the visible offsets in earlier revisions.
+    """
     if arm_builder is None or arm_builder.armature is None:
         return
-
-    # SkinNode-driven meshes already have vertex groups + Armature modifier.
-    # Re-parenting them to a single bone would override the deformation.
+    if obj.type != "MESH":
+        return
+    # SkinNode meshes already have an Armature modifier with proper weights.
     if obj.modifiers and any(m.type == "ARMATURE" for m in obj.modifiers):
         return
 
-    anim_idx = xf.find_animating_ancestor(parent_node, nodes)
-    if anim_idx < 0 or anim_idx not in arm_builder.bone_for_node:
+    parent_node = int(obj.get("edm_parent_node", -1))
+    if parent_node < 0:
+        return
+    bone_idx = _first_rig_ancestor(parent_node, nodes, arm_builder.bone_for_node)
+    if bone_idx < 0 or bone_idx not in arm_builder.bone_for_node:
         return
 
+    bone_name = arm_builder.bone_for_node[bone_idx]
     arm = arm_builder.armature
-    bone_name = arm_builder.bone_for_node[anim_idx]
+
+    # Preserve the world matrix we already computed (axis_mat @ world_mat).
+    world_mat = obj.matrix_world.copy()
+    obj.parent = arm
+    obj.matrix_world = world_mat
+
+    # Single full-weight vertex group + Armature modifier so the mesh
+    # follows the bone for every keyframe of every action.
+    if bone_name not in obj.vertex_groups:
+        vg = obj.vertex_groups.new(name=bone_name)
+        vg.add([v.index for v in obj.data.vertices], 1.0, "REPLACE")
+
+    modifier = obj.modifiers.new(name="Armature", type="ARMATURE")
+    modifier.object = arm
+    modifier.use_vertex_groups = True
+    modifier.use_bone_envelopes = False
+
+
+def _attach_extra_to_bone(
+    obj: bpy.types.Object,
+    nodes: Sequence,
+    arm_builder: Optional[ArmatureBuilder],
+) -> None:
+    """Bone-parent connectors / lights so they follow the rig.
+
+    We *can't* use the vertex-group-with-modifier trick on Empty/Light
+    objects because they have no mesh, so we fall back to a classic
+    ``parent_type='BONE'`` parenting and re-apply the world matrix once
+    parenting is in place — this lets Blender compute the correct
+    ``matrix_parent_inverse`` automatically.
+    """
+    if arm_builder is None or arm_builder.armature is None:
+        return
+    parent_node = int(obj.get("edm_parent_node", -1))
+    if parent_node < 0:
+        return
+    bone_idx = _first_rig_ancestor(parent_node, nodes, arm_builder.bone_for_node)
+    if bone_idx < 0 or bone_idx not in arm_builder.bone_for_node:
+        return
+    bone_name = arm_builder.bone_for_node[bone_idx]
+    arm = arm_builder.armature
 
     world_mat = obj.matrix_world.copy()
     obj.parent = arm
     obj.parent_type = "BONE"
     obj.parent_bone = bone_name
-    bone = arm.data.bones.get(bone_name)
-    if bone is not None:
-        # Compose the inverse so that obj stays put visually while the
-        # bone's rest pose now owns its placement.
-        obj.matrix_parent_inverse = (
-            arm.matrix_world @ bone.matrix_local
-        ).inverted()
     obj.matrix_world = world_mat
+
+
+def _first_rig_ancestor(
+    node_idx: int,
+    nodes: Sequence,
+    bone_for_node: Dict[int, str],
+) -> int:
+    """Walk up the parent chain, returning the first node that has a bone."""
+    seen: set = set()
+    while 0 <= node_idx < len(nodes):
+        if node_idx in seen:
+            return -1
+        seen.add(node_idx)
+        if node_idx in bone_for_node:
+            return node_idx
+        node_idx = getattr(nodes[node_idx], "parent_idx", -1)
+    return -1

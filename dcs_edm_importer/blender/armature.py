@@ -15,9 +15,17 @@ We translate that into Blender like so:
   * Each unique animation argument becomes one **action**
     (``<model>_arg<NN>``) whose fcurves drive the relevant bones'
     ``location`` / ``rotation_quaternion`` / ``scale``.
-  * Visibility arguments become per-object ``hide_render`` actions,
-    handled in :func:`apply_visibility_actions` (called by the importer
-    after meshes are built).
+  * The lowest-numbered action is set as the armature's *active* action
+    so the user sees animation immediately when scrubbing the timeline.
+  * Other actions are kept in ``bpy.data.actions`` for the user to
+    select via the Action Editor's "Browse" dropdown.
+  * Visibility arguments become per-object ``hide_render`` actions
+    (handled in :func:`apply_visibility_actions`).
+
+Why no NLA stack? The previous implementation pushed every action into
+its own NLA track *muted by default*, which silently broke the
+"timeline scrub shows nothing" path for users. Keeping actions in
+the library and binding the most-likely default makes the UI obvious.
 
 Frame mapping: argument value 0.0 -> frame 1, 1.0 -> frame 101.
 
@@ -28,7 +36,7 @@ to attach. Static bones simply don't have any keyframe data.
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import bpy
 import mathutils
@@ -102,7 +110,6 @@ class ArmatureBuilder:
         arm_obj.matrix_world = self._axis_mat
         self._arm_obj = arm_obj
 
-        # Save the previous active object so we can restore it.
         prev_active = bpy.context.view_layer.objects.active
         bpy.context.view_layer.objects.active = arm_obj
         try:
@@ -118,7 +125,7 @@ class ArmatureBuilder:
                 bpy.context.view_layer.objects.active = prev_active
 
         self._build_actions()
-        self._stack_actions_into_nla()
+        self._activate_default_action()
         return arm_obj
 
     # ----------------------------------------------------------- internals
@@ -129,15 +136,13 @@ class ArmatureBuilder:
             bone_name = self._bone_name_for(idx, node)
             bone = edit_bones.new(bone_name)
 
-            # Place the bone at the node's rest-pose translation derived
-            # from the parent chain so meshes parented to the bone land
-            # at the correct default position. The bone's "tail" sits a
-            # tiny distance away in armature-local Z so the bone has
-            # nonzero length (Blender requires this).
             world = xf.world_matrix_for_node(idx, self._nodes)
             head = world.translation
+            # A length of 0.05 (5 cm) gives the bone enough volume that
+            # Blender doesn't auto-delete it but stays small enough to be
+            # invisible against a typical aircraft mesh.
             bone.head = head
-            bone.tail = head + mathutils.Vector((0.0, 0.0, 0.05))
+            bone.tail = head + mathutils.Vector((0.0, 0.05, 0.0))
             self._bone_for_node[idx] = bone_name
 
     def _set_bone_parents(self, bone_indices: List[int], arm_data) -> None:
@@ -148,8 +153,6 @@ class ArmatureBuilder:
             if parent_idx >= 0 and parent_idx in self._bone_for_node:
                 child = edit_bones[self._bone_for_node[idx]]
                 child.parent = edit_bones[self._bone_for_node[parent_idx]]
-                # Connect head to parent's tail when the child sits exactly
-                # on the parent's head — looks tidier in the viewport.
 
     def _first_rig_ancestor(self, idx: int) -> int:
         seen = set()
@@ -163,11 +166,10 @@ class ArmatureBuilder:
         return -1
 
     def _bone_name_for(self, idx: int, node) -> str:
-        # Sanitise: spaces and dots break fcurve datapaths.
-        raw = (getattr(node, "name", "") or f"bone_{idx}").replace(" ", "_").replace(".", "_")
-        if raw not in self._bone_for_node.values():
-            return raw
-        return f"{raw}_{idx:03d}"
+        # Sanitise: spaces and dots break fcurve datapaths. Append the
+        # scene-graph index to guarantee uniqueness.
+        raw = (getattr(node, "name", "") or "bone").replace(" ", "_").replace(".", "_")
+        return f"{raw}_{idx:04d}"
 
     # ------------------------------------------------------------ actions
     def _build_actions(self) -> None:
@@ -184,17 +186,19 @@ class ArmatureBuilder:
     def _build_arg_anim_actions(self, node: t.ArgAnimationNode, bone_name: str) -> None:
         """Generate per-argument fcurves for one ArgAnimationNode.
 
-        We follow the spec formula
-            transform = mat * Translate(pos) * Quat1 * keyRot * Scale
-        but apply it as a *delta from rest* in pose-bone space, since
-        Blender's pose bones are evaluated relative to the bone's edit
-        (rest) pose. The rest pose itself was placed at the world
-        position derived from the same parent chain in :meth:`_create_bones`,
-        so rotations/translations come out visually correct.
-        """
-        base = node.base
-        q1 = xf.quat_from_wxyz(base.quat1)
+        Pose-bone keyframes are written *as-is* — DCS keyframe values
+        already describe the local delta relative to the rest pose,
+        which is exactly what Blender's pose-bone ``location`` /
+        ``rotation_quaternion`` / ``scale`` datapaths expect. Pre-
+        composing ``Quat1`` (as our previous implementation did) ended
+        up double-applying the rest rotation in many cases, so we
+        keep the fcurve values direct.
 
+        The bone's rest pose already includes ``Quat1`` because we
+        built it from :func:`world_matrix_for_node` which composes the
+        full ``base.matrix * Translate(pos) * Quat1 * Scale * Quat2``
+        chain.
+        """
         # ---- Position keyframes ---------------------------------------
         for arg, keys in node.pos_data:
             if not keys:
@@ -203,39 +207,24 @@ class ArmatureBuilder:
             data_path = f'pose.bones["{bone_name}"].location'
             for key in keys:
                 frame = _arg_to_frame(key.frame)
-                # Use the key value directly; the rig already encodes the
-                # base position at rest, so this is the local delta.
                 value = tuple(key.value)
                 for ch in range(min(3, len(value))):
-                    fc = (
-                        action.fcurves.find(data_path, index=ch)
-                        or action.fcurves.new(data_path, index=ch, action_group=bone_name)
-                    )
+                    fc = self._fcurve(action, data_path, ch, bone_name)
                     fc.keyframe_points.insert(frame, float(value[ch]))
 
         # ---- Rotation keyframes ---------------------------------------
-        # The reference importer applies ``leftRot * keyRot * rightRot``
-        # where leftRot includes both the matrix's rotation and base.quat1.
-        # We do the same so file-stored absolute rotations turn into
-        # correct local pose rotations.
         for arg, keys in node.rot_data:
             if not keys:
                 continue
             action = self._action_for_arg(arg)
             data_path = f'pose.bones["{bone_name}"].rotation_quaternion'
-            # Pre-compose: q1 stays constant per node, applied as left.
             for key in keys:
                 frame = _arg_to_frame(key.frame)
                 key_quat = xf.quat_from_wxyz(key.value)
-                # Combine as q1 * keyQuat — yields the local pose rotation
-                # relative to the bone's rest, which already contains the
-                # parent chain via edit-bone placement.
-                combined = q1 @ key_quat
-                for ch, comp in enumerate((combined.w, combined.x, combined.y, combined.z)):
-                    fc = (
-                        action.fcurves.find(data_path, index=ch)
-                        or action.fcurves.new(data_path, index=ch, action_group=bone_name)
-                    )
+                for ch, comp in enumerate(
+                    (key_quat.w, key_quat.x, key_quat.y, key_quat.z)
+                ):
+                    fc = self._fcurve(action, data_path, ch, bone_name)
                     fc.keyframe_points.insert(frame, float(comp))
 
         # ---- Scale keyframes ------------------------------------------
@@ -247,46 +236,48 @@ class ArmatureBuilder:
             for key in keys_a:
                 frame = _arg_to_frame(key.frame)
                 # Spec stores 4 doubles; first three are XYZ scale.
-                sx, sy, sz, _ = key.value
+                if len(key.value) >= 3:
+                    sx, sy, sz = key.value[0], key.value[1], key.value[2]
+                else:
+                    sx = sy = sz = 1.0
                 for ch, comp in enumerate((sx, sy, sz)):
-                    fc = (
-                        action.fcurves.find(data_path, index=ch)
-                        or action.fcurves.new(data_path, index=ch, action_group=bone_name)
-                    )
+                    fc = self._fcurve(action, data_path, ch, bone_name)
                     fc.keyframe_points.insert(frame, float(comp))
+
+    @staticmethod
+    def _fcurve(action, data_path: str, index: int, group: str):
+        fc = action.fcurves.find(data_path, index=index)
+        if fc is None:
+            fc = action.fcurves.new(data_path, index=index, action_group=group)
+        return fc
 
     def _action_for_arg(self, arg: int) -> bpy.types.Action:
         action = self._actions.get(arg)
         if action is None:
             action = bpy.data.actions.new(f"{self._model_name}_arg{arg:03d}")
             action["edm_argument"] = int(arg)
+            # Mark with a fake-user so the action survives the next
+            # "Save & Reload" round-trip even when no armature is
+            # currently bound to it.
+            action.use_fake_user = True
             self._actions[arg] = action
         return action
 
-    def _stack_actions_into_nla(self) -> None:
+    def _activate_default_action(self) -> None:
+        """Bind the lowest-numbered action so timeline scrubbing works.
+
+        DCS argument 0 is, by overwhelming convention, the aileron — so
+        new users immediately see *something* moving when they scrub the
+        timeline. They can pick a different action via the Action
+        Editor's "Browse" dropdown.
+        """
         if not self._arm_obj or not self._actions:
             return
         ad = self._arm_obj.animation_data
         if ad is None:
             return
-        for arg, action in sorted(self._actions.items()):
-            track = ad.nla_tracks.new()
-            track.name = action.name
-            try:
-                strip = track.strips.new(action.name, 1, action)
-                # Compute the action range from its fcurves. Default to a
-                # sensible 1..101 if the action only has unit-time keys.
-                max_frame = 101
-                for fc in action.fcurves:
-                    for kp in fc.keyframe_points:
-                        if kp.co[0] > max_frame:
-                            max_frame = int(kp.co[0])
-                strip.action_frame_start = 1
-                strip.action_frame_end = max_frame
-                track.mute = True   # Don't auto-play; let users enable per-track.
-            except RuntimeError:
-                continue
-        ad.action = None
+        first_arg = min(self._actions.keys())
+        ad.action = self._actions[first_arg]
 
 
 # ---------------------------------------------------------------------------
@@ -309,22 +300,15 @@ def apply_visibility_actions(
         if obj.animation_data is None:
             obj.animation_data_create()
         for arg, ranges in node.vis_data:
-            action_name = f"{model_name}_vis_arg{arg:03d}_{idx}"
+            action_name = f"{model_name}_vis_arg{arg:03d}_{idx:04d}"
             action = bpy.data.actions.new(action_name)
             action["edm_argument"] = int(arg)
+            action.use_fake_user = True
             curve = action.fcurves.new("hide_render")
             for (start, end) in ranges:
                 f_start = _arg_to_frame(start)
-                # Cap unrealistically large 'end' (often 1e300 in DCS files
-                # to mean "permanently visible") at 1.0 = frame 101.
                 f_end = _arg_to_frame(min(end, 1.0)) if end < 1e6 else _arg_to_frame(1.0)
                 kp = curve.keyframe_points.insert(f_start, 0.0)
                 kp.interpolation = "CONSTANT"
                 kp = curve.keyframe_points.insert(f_end, 1.0)
                 kp.interpolation = "CONSTANT"
-            track = obj.animation_data.nla_tracks.new()
-            track.name = action_name
-            try:
-                track.strips.new(action_name, 1, action)
-            except RuntimeError:
-                pass

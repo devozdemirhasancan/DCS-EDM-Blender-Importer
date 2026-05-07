@@ -1,12 +1,17 @@
 name: Sync Wiki
 
 # Pushes the Markdown files in `wiki/` to the repository's GitHub Wiki
-# whenever the contents change on `main`. GitHub maintains the wiki as
-# its own git repository at `<owner>/<repo>.wiki.git`, so we clone it,
-# overlay our `wiki/` directory on top, and push.
+# whenever the contents change on `main`.
 #
-# This lets the wiki be edited via PRs (in the main repo) instead of
-# the GitHub web UI, which gives us code review and history.
+# IMPORTANT — One-time setup the repo owner has to do manually:
+#   1. GitHub UI: repo Settings -> Features -> tick "Wikis"
+#   2. GitHub UI: open the Wiki tab, click "Create the first page"
+#      and save *anything* (a single character is fine). This is what
+#      actually creates the underlying <repo>.wiki.git repository so
+#      this workflow has somewhere to push to.
+#
+# After that, every push to main that touches `wiki/**` keeps the wiki
+# in lock-step with the markdown files in this repo.
 
 on:
   push:
@@ -34,17 +39,28 @@ jobs:
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
       - name: Clone wiki repo
+        id: wiki-clone
         run: |
-          git clone "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.wiki.git" wiki || \
-          ( mkdir wiki && cd wiki && git init && \
-            git remote add origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.wiki.git" )
+          set -e
+          if git clone --quiet "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.wiki.git" wiki 2>/dev/null; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Successfully cloned existing wiki repository."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "::warning title=Wiki not initialised::The repository's wiki has not been created yet. Open https://github.com/${{ github.repository }}/wiki and click 'Create the first page' (saving any content), then re-run this workflow."
+            exit 0
+          fi
 
       - name: Overlay markdown files
+        if: steps.wiki-clone.outputs.exists == 'true'
         run: |
-          # Wipe the wiki so deletes propagate, but keep the .git directory.
+          # Wipe the wiki content (but keep .git so commits are atomic).
           find wiki -mindepth 1 -maxdepth 1 ! -name '.git' -exec rm -rf {} +
-          cp -r main/wiki/* wiki/ 2>/dev/null || true
-          # Make sure the home page exists.
+          # Copy our wiki/ markdown over.
+          if [ -d main/wiki ]; then
+            cp -r main/wiki/. wiki/
+          fi
+          # Make sure Home.md exists — GitHub displays it as the wiki landing page.
           if [ ! -f wiki/Home.md ]; then
             echo "# DCS EDM Blender Importer" > wiki/Home.md
             echo "Welcome to the wiki." >> wiki/Home.md
@@ -52,16 +68,15 @@ jobs:
           ls -la wiki
 
       - name: Commit & push
+        if: steps.wiki-clone.outputs.exists == 'true'
         working-directory: wiki
         run: |
-          if [ ! -d .git ]; then
-            git init
-            git remote add origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.wiki.git"
-          fi
           git add .
-          if ! git diff --staged --quiet; then
-            git commit -m "Sync wiki from ${{ github.sha }}"
-            git push origin HEAD:master || git push origin HEAD:main
-          else
+          if git diff --staged --quiet; then
             echo "No wiki changes to publish."
+            exit 0
           fi
+          git commit -m "Sync wiki from ${{ github.sha }}"
+          # GitHub wikis use either 'master' or 'main' depending on the repo's
+          # default-branch setting, so try both.
+          git push origin HEAD:master 2>/dev/null || git push origin HEAD:main
