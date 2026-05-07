@@ -1,0 +1,31 @@
+# Blender 4.2+ extension manifest.
+#
+# Blender 4.2 introduced a new "extension" packaging format alongside the
+# legacy bl_info add-on style. Both can coexist in the same package — this
+# file lets the new Extensions dialog discover the add-on while bl_info
+# keeps it working for users on Blender 4.0 and 4.1.
+#
+# Reference: https://docs.blender.org/manual/en/4.2/extensions/getting_started.html
+
+schema_version = "1.0.0"
+
+id = "dcs_edm_importer"
+version = "0.2.0"
+name = "DCS World EDM Importer"
+tagline = "Import DCS World EDM models with materials, rig and animations"
+maintainer = "Community Port"
+type = "add-on"
+
+website = "https://github.com/ndevenish/Blender_ioEDM"
+
+tags = ["Import-Export"]
+
+blender_version_min = "4.0.0"
+
+# Free-form license string. The DCS / EDM format itself remains the
+# property of Eagle Dynamics; this importer is community-developed.
+license = ["SPDX:MIT"]
+
+copyright = ["2025 Community contributors"]
+
+permissions = { files = "Read .edm and texture files from disk" }
